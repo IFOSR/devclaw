@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+.devclaw-runs/
+.devclaw-smoke/
+.devclaw/
+.devclaw.log
+projects/

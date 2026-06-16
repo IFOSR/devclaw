@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_DIR="$(pwd)"
+
+DEVCLAW_INTENT="${DEVCLAW_INTENT:-Build a customer feedback triage Agent}"
+DEVCLAW_WORKSPACE="${DEVCLAW_WORKSPACE:-$PROJECT_DIR}"
+DEVCLAW_PID_FILE="${DEVCLAW_PID_FILE:-$PROJECT_DIR/.devclaw/devclaw.pid}"
+DEVCLAW_LOG_FILE="${DEVCLAW_LOG_FILE:-$PROJECT_DIR/.devclaw/devclaw.log}"
+DEVCLAW_EXECUTOR="${DEVCLAW_EXECUTOR:-codex}"
+DEVCLAW_VERIFIER="${DEVCLAW_VERIFIER:-deepseek}"
+DEVCLAW_MAX_ROUNDS="${DEVCLAW_MAX_ROUNDS:-3}"
+
+usage() {
+  cat <<EOF
+DevClaw control script
+
+Usage:
+  scripts/devclaw start
+  scripts/devclaw chat
+  scripts/devclaw once
+  scripts/devclaw stop
+  scripts/devclaw restart
+  scripts/devclaw status
+  scripts/devclaw help
+
+Environment:
+  DEVCLAW_INTENT      Natural-language R&D request.
+  DEVCLAW_WORKSPACE   Project directory. Default: current working directory
+  DEVCLAW_PID_FILE    PID file. Default: <project>/.devclaw/devclaw.pid
+  DEVCLAW_LOG_FILE    Log file. Default: <project>/.devclaw/devclaw.log
+  DEVCLAW_EXECUTOR    codex. Default: codex
+  DEVCLAW_VERIFIER    deepseek. Default: deepseek
+  DEVCLAW_MAX_ROUNDS  Rework rounds. Default: 3
+
+Interactive commands:
+  /help
+  /status
+  /config
+  /clear
+  /run <requirement>
+  /exit
+
+Examples:
+  scripts/devclaw start
+  DEVCLAW_INTENT="Build an invoice analysis Agent" scripts/devclaw once
+  DEVCLAW_EXECUTOR=codex DEVCLAW_VERIFIER=deepseek scripts/devclaw restart
+EOF
+}
+
+is_running() {
+  [[ -f "$DEVCLAW_PID_FILE" ]] || return 1
+  local pid
+  pid="$(cat "$DEVCLAW_PID_FILE")"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" >/dev/null 2>&1
+}
+
+start() {
+  chat
+}
+
+once() {
+  (
+    export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+    python3 -m devclaw \
+      --workspace "$DEVCLAW_WORKSPACE" \
+      --executor "$DEVCLAW_EXECUTOR" \
+      --verifier "$DEVCLAW_VERIFIER" \
+      --max-rounds "$DEVCLAW_MAX_ROUNDS" \
+      run "$DEVCLAW_INTENT"
+  )
+}
+
+start_background() {
+  if is_running; then
+    echo "DevClaw is already running with PID $(cat "$DEVCLAW_PID_FILE")."
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$DEVCLAW_PID_FILE")" "$(dirname "$DEVCLAW_LOG_FILE")" "$DEVCLAW_WORKSPACE"
+  : > "$DEVCLAW_LOG_FILE"
+
+  (
+    export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+    python3 -m devclaw \
+      --workspace "$DEVCLAW_WORKSPACE" \
+      --executor "$DEVCLAW_EXECUTOR" \
+      --verifier "$DEVCLAW_VERIFIER" \
+      --max-rounds "$DEVCLAW_MAX_ROUNDS"
+  ) >>"$DEVCLAW_LOG_FILE" 2>&1 &
+
+  local pid=$!
+  echo "$pid" > "$DEVCLAW_PID_FILE"
+  echo "DevClaw started with PID $pid."
+  echo "Log: $DEVCLAW_LOG_FILE"
+}
+
+chat() {
+  export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+  python3 -m devclaw \
+    --workspace "$DEVCLAW_WORKSPACE" \
+    --executor "$DEVCLAW_EXECUTOR" \
+    --verifier "$DEVCLAW_VERIFIER" \
+    --max-rounds "$DEVCLAW_MAX_ROUNDS"
+}
+
+stop() {
+  if ! is_running; then
+    rm -f "$DEVCLAW_PID_FILE"
+    echo "DevClaw is not running."
+    return 0
+  fi
+
+  local pid
+  pid="$(cat "$DEVCLAW_PID_FILE")"
+  kill "$pid" >/dev/null 2>&1 || true
+  rm -f "$DEVCLAW_PID_FILE"
+  echo "DevClaw stopped."
+}
+
+status() {
+  if is_running; then
+    echo "DevClaw is running with PID $(cat "$DEVCLAW_PID_FILE")."
+  else
+    echo "DevClaw is not running."
+  fi
+}
+
+case "${1:-help}" in
+  start)
+    start
+    ;;
+  stop)
+    stop
+    ;;
+  restart)
+    stop
+    start
+    ;;
+  chat)
+    chat
+    ;;
+  once)
+    once
+    ;;
+  background)
+    start_background
+    ;;
+  status)
+    status
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "Unknown command: $1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
