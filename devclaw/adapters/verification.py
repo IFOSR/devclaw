@@ -162,6 +162,82 @@ class DeepseekTuiVerificationAdapter:
             content=result.stdout.strip(),
         )
 
+    def select_context(self, intent: str, raw_context_pack: str, workspace: Path) -> str:
+        prompt = _context_selector_prompt(intent, raw_context_pack)
+        try:
+            result = run_tool_with_idle_monitor(
+                [
+                    self.deepseek_bin,
+                    "exec",
+                    "--auto",
+                    "--sandbox-mode",
+                    "danger-full-access",
+                    "--approval-policy",
+                    "never",
+                    prompt,
+                ],
+                cwd=workspace,
+                idle_timeout_seconds=self.idle_timeout_seconds,
+                on_output=self._on_tool_output,
+                on_heartbeat=self._on_tool_heartbeat,
+                heartbeat_interval_seconds=60,
+            )
+        except TimeoutError as exc:
+            _write_transcript(workspace, "deepseek-context-selector.txt", prompt, "", str(exc), 124)
+            raise RuntimeError(str(exc)) from exc
+        _write_transcript(
+            workspace,
+            "deepseek-context-selector.txt",
+            prompt,
+            result.stdout,
+            result.stderr,
+            result.returncode,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr or result.stdout)
+        return result.stdout.strip()
+
+    def generate_acceptance_checks(
+        self,
+        brief: ProjectBrief,
+        contract: AcceptanceContract,
+        workspace: Path,
+        context_summary: str,
+    ) -> str:
+        prompt = _acceptance_check_prompt(brief, contract, context_summary)
+        try:
+            result = run_tool_with_idle_monitor(
+                [
+                    self.deepseek_bin,
+                    "exec",
+                    "--auto",
+                    "--sandbox-mode",
+                    "danger-full-access",
+                    "--approval-policy",
+                    "never",
+                    prompt,
+                ],
+                cwd=workspace,
+                idle_timeout_seconds=self.idle_timeout_seconds,
+                on_output=self._on_tool_output,
+                on_heartbeat=self._on_tool_heartbeat,
+                heartbeat_interval_seconds=60,
+            )
+        except TimeoutError as exc:
+            _write_transcript(workspace, "deepseek-acceptance-checks.txt", prompt, "", str(exc), 124)
+            raise RuntimeError(str(exc)) from exc
+        _write_transcript(
+            workspace,
+            "deepseek-acceptance-checks.txt",
+            prompt,
+            result.stdout,
+            result.stderr,
+            result.returncode,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr or result.stdout)
+        return _ensure_trailing_newline(_strip_code_fence(result.stdout.strip()))
+
     def _on_tool_output(self, stream: str, chunk: str) -> None:
         if self.progress is None:
             return
@@ -322,6 +398,64 @@ def _write_transcript(
         ),
         encoding="utf-8",
     )
+
+
+def _context_selector_prompt(intent: str, raw_context_pack: str) -> str:
+    return "\n".join(
+        [
+            "You are the DevClaw Context Selector.",
+            "Summarize only the context that is relevant to the current request.",
+            "Prefer concise bullets. Include stage document paths that should be consulted.",
+            "Do not invent facts. If context is not relevant, say so.",
+            "",
+            "# Current Request",
+            intent,
+            "",
+            "# Raw Context Pack",
+            raw_context_pack[:16000],
+            "",
+            "Return Markdown with these sections:",
+            "# Context Summary",
+            "## Relevant Prior Work",
+            "## Files And Stage Docs To Inspect",
+            "## Risks Or Missing Context",
+        ]
+    )
+
+
+def _acceptance_check_prompt(
+    brief: ProjectBrief,
+    contract: AcceptanceContract,
+    context_summary: str,
+) -> str:
+    return "\n".join(
+        [
+            "You are the DevClaw Acceptance Check Generator.",
+            "Return only Python code for .devclaw/checks/acceptance_checks.py.",
+            "The script must be deterministic, runnable with python3, and must not require network access.",
+            "It should exit 0 only when blocking acceptance appears satisfied.",
+            "Use conservative checks grounded in the workspace and contract.",
+            "",
+            f"Goal: {brief.goal}",
+            "",
+            "Acceptance:",
+            *[f"- {item.id}: {item.description}" for item in contract.blocking_items()],
+            "",
+            "Context Summary:",
+            context_summary[:8000],
+            "",
+            "Return only Python code. Do not include Markdown or code fences.",
+        ]
+    )
+
+
+def _strip_code_fence(output: str) -> str:
+    match = re.fullmatch(r"```(?:python)?\s*(.*?)\s*```", output, flags=re.DOTALL)
+    return match.group(1).strip() + "\n" if match else output
+
+
+def _ensure_trailing_newline(output: str) -> str:
+    return output if output.endswith("\n") else output + "\n"
 
 
 def _role_prompt(

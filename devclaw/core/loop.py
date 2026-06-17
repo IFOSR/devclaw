@@ -36,7 +36,7 @@ from devclaw.core.stage_docs import (
     write_workflow_plan_document,
     write_verification_document,
 )
-from devclaw.core.workflow_router import WorkflowRoute, route_workflow
+from devclaw.core.workflow_router import WorkflowRoute, route_from_planner_output, route_workflow
 
 
 class DevClawLead:
@@ -75,7 +75,9 @@ class DevClawLead:
         context_dir.mkdir(parents=True, exist_ok=True)
         stage_root = stage_run_dir(workspace, brief.project_id, session.session_id)
         context_pack = build_context_pack(workspace, intent)
-        route = route_workflow(intent, context_pack.has_prior_context)
+        semantic_context = self._select_context(intent, context_pack.markdown, workspace)
+        _write_text(context_dir / "semantic-context-summary.md", semantic_context)
+        route, planner_mode = self._plan_workflow(intent, context_pack.markdown, context_pack.has_prior_context, workspace)
         workflow_assignments = [ROLE_ASSIGNMENTS[key] for key in route.run_role_keys]
         self._workflow_steps = {
             assignment.role: (index, len(workflow_assignments))
@@ -87,7 +89,7 @@ class DevClawLead:
             "Workflow Router",
             "planned",
             route.reason,
-            mode="local",
+            mode=planner_mode,
             workflow_mode=route.mode.value,
             running_roles=str(len(route.run_role_keys)),
             reused_roles=str(len(route.skip_role_keys)),
@@ -99,7 +101,8 @@ class DevClawLead:
         _write_json(metadata_dir / "project-brief.json", brief.to_dict())
         _write_json(metadata_dir / "acceptance-contract.json", contract.to_dict())
         write_intake_documents(stage_root, brief, contract)
-        generate_acceptance_checks(workspace, brief, contract)
+        generated_checks = self._generate_acceptance_checks(brief, contract, workspace, semantic_context)
+        generate_acceptance_checks(workspace, brief, contract, generated_checks)
         intake_output = self._run_role(ROLE_ASSIGNMENTS["intake"], brief, contract, workspace, [])
         write_agent_stage_document(stage_root, "intake", intake_output, "codex-intake.md")
         self._emit("intake", "DevClaw Lead", "completed", "Acceptance contract generated.", mode="local")
@@ -306,6 +309,50 @@ class DevClawLead:
             gap_reports=gap_reports,
             final_report=final_report,
         )
+
+    def _plan_workflow(
+        self,
+        intent: str,
+        context_pack: str,
+        has_prior_context: bool,
+        workspace: Path,
+    ) -> tuple[WorkflowRoute, str]:
+        planner = getattr(self.execution_adapter, "plan_workflow", None)
+        if callable(planner):
+            try:
+                output = planner(intent, context_pack, workspace)
+                return route_from_planner_output(output, has_prior_context), "codex"
+            except (AttributeError, RuntimeError, ValueError):
+                pass
+        return route_workflow(intent, has_prior_context), "local-fallback"
+
+    def _select_context(self, intent: str, raw_context_pack: str, workspace: Path) -> str:
+        selector = getattr(self.verification_adapter, "select_context", None)
+        if callable(selector):
+            try:
+                summary = selector(intent, raw_context_pack, workspace)
+                if summary.strip():
+                    return summary
+            except (AttributeError, RuntimeError, ValueError):
+                pass
+        return "# Context Summary\n\n- Deepseek context selection unavailable; using raw context pack references.\n"
+
+    def _generate_acceptance_checks(
+        self,
+        brief,
+        contract,
+        workspace: Path,
+        semantic_context: str,
+    ) -> str | None:
+        generator = getattr(self.verification_adapter, "generate_acceptance_checks", None)
+        if callable(generator):
+            try:
+                script = generator(brief, contract, workspace, semantic_context)
+                if script.strip():
+                    return script
+            except (AttributeError, RuntimeError, ValueError):
+                pass
+        return None
 
     def _run_agent(self, stage: str, agent: str, fn, *args) -> AgentOutput:
         self._emit(stage, agent, "started", "Running.", mode="local")

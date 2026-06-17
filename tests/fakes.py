@@ -13,6 +13,12 @@ from devclaw.core.role_assignments import RoleAssignment
 class TestExecutionAdapter:
     def __init__(self):
         self.role_calls: list[str] = []
+        self.planner_outputs: list[str] = []
+
+    def plan_workflow(self, intent: str, context_pack: str, workspace: Path) -> str:
+        if not self.planner_outputs:
+            raise AttributeError("planner not configured")
+        return self.planner_outputs.pop(0)
 
     def run_role(
         self,
@@ -51,6 +57,24 @@ class TestExecutionAdapter:
 class TestVerificationAdapter:
     def __init__(self):
         self.role_calls: list[str] = []
+        self.context_summaries: list[str] = []
+        self.generated_checks: list[str] = []
+
+    def select_context(self, intent: str, raw_context_pack: str, workspace: Path) -> str:
+        if self.context_summaries:
+            return self.context_summaries.pop(0)
+        return "# Deepseek Context Summary\n\n- No extra semantic filtering configured.\n"
+
+    def generate_acceptance_checks(
+        self,
+        brief: ProjectBrief,
+        contract: AcceptanceContract,
+        workspace: Path,
+        context_summary: str,
+    ) -> str:
+        if self.generated_checks:
+            return self.generated_checks.pop(0)
+        return ""
 
     def run_role(
         self,

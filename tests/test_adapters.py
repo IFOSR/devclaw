@@ -188,6 +188,36 @@ def test_codex_cli_prompt_execution_preserves_real_codex_home_for_skills(monkeyp
     assert calls[0][1]["on_output"] is not None
 
 
+def test_codex_cli_adapter_runs_workflow_planner(monkeypatch, tmp_path: Path):
+    calls = []
+
+    def fake_run_tool(cmd, cwd, idle_timeout_seconds, env=None, on_output=None, **kwargs):
+        calls.append((cmd, {"cwd": cwd, "idle_timeout_seconds": idle_timeout_seconds, "env": env, "on_output": on_output}))
+        return ToolExecutionResult(
+            returncode=0,
+            stdout='{"mode":"targeted-change","reason":"Localized page performance optimization."}',
+            stderr="",
+        )
+
+    monkeypatch.setattr("devclaw.adapters.execution.run_tool_with_idle_monitor", fake_run_tool)
+
+    output = CodexCliExecutionAdapter(codex_bin="codex-test").plan_workflow(
+        "页面太卡顿了，需要的页面加速。",
+        "# DevClaw Context Pack\n\nprior context",
+        tmp_path,
+    )
+
+    cmd, kwargs = calls[0]
+    assert cmd[:2] == ["codex-test", "exec"]
+    assert "-C" in cmd
+    assert "Workflow Planner" in cmd[-1]
+    assert "Return only JSON" in cmd[-1]
+    assert "页面太卡顿" in cmd[-1]
+    assert kwargs["cwd"] == tmp_path
+    assert kwargs["on_output"] is not None
+    assert '"targeted-change"' in output
+
+
 def test_codex_cli_adapter_rejects_confirmation_only_responses(monkeypatch, tmp_path: Path):
     brief, contract = _contract()
 
@@ -295,6 +325,60 @@ def test_deepseek_tui_adapter_uses_non_interactive_exec(monkeypatch, tmp_path: P
     transcript = tmp_path / ".devclaw" / "reports" / "tool-transcripts" / "deepseek-verification.txt"
     assert transcript.exists()
     assert "Looks pass" in transcript.read_text()
+
+
+def test_deepseek_tui_adapter_selects_context_summary(monkeypatch, tmp_path: Path):
+    calls = []
+
+    def fake_run_tool(cmd, cwd, idle_timeout_seconds, on_output=None, **kwargs):
+        calls.append((cmd, {"cwd": cwd, "idle_timeout_seconds": idle_timeout_seconds, "on_output": on_output}))
+        return ToolExecutionResult(returncode=0, stdout="# Context Summary\n\n- Use prior performance work.", stderr="")
+
+    monkeypatch.setattr("devclaw.adapters.verification.run_tool_with_idle_monitor", fake_run_tool)
+
+    output = DeepseekTuiVerificationAdapter(deepseek_bin="deepseek-test").select_context(
+        "页面太卡顿了，需要页面加速。",
+        "# DevClaw Context Pack\n\nraw context",
+        tmp_path,
+    )
+
+    cmd, kwargs = calls[0]
+    assert cmd[:2] == ["deepseek-test", "exec"]
+    assert "--auto" in cmd
+    assert "Context Selector" in cmd[-1]
+    assert "页面太卡顿" in cmd[-1]
+    assert kwargs["cwd"] == tmp_path
+    assert "# Context Summary" in output
+    transcript = tmp_path / ".devclaw" / "reports" / "tool-transcripts" / "deepseek-context-selector.txt"
+    assert transcript.exists()
+
+
+def test_deepseek_tui_adapter_generates_acceptance_checks(monkeypatch, tmp_path: Path):
+    brief, contract = _contract()
+    calls = []
+    script = "def main() -> int:\n    return 0\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n"
+
+    def fake_run_tool(cmd, cwd, idle_timeout_seconds, on_output=None, **kwargs):
+        calls.append((cmd, {"cwd": cwd, "idle_timeout_seconds": idle_timeout_seconds, "on_output": on_output}))
+        return ToolExecutionResult(returncode=0, stdout=script, stderr="")
+
+    monkeypatch.setattr("devclaw.adapters.verification.run_tool_with_idle_monitor", fake_run_tool)
+
+    output = DeepseekTuiVerificationAdapter(deepseek_bin="deepseek-test").generate_acceptance_checks(
+        brief,
+        contract,
+        tmp_path,
+        "# Context Summary\n",
+    )
+
+    cmd, kwargs = calls[0]
+    assert cmd[:2] == ["deepseek-test", "exec"]
+    assert "Acceptance Check Generator" in cmd[-1]
+    assert "Return only Python code" in cmd[-1]
+    assert kwargs["cwd"] == tmp_path
+    assert output == script
+    transcript = tmp_path / ".devclaw" / "reports" / "tool-transcripts" / "deepseek-acceptance-checks.txt"
+    assert transcript.exists()
 
 
 def test_deepseek_tui_adapter_runs_role_task_with_skills_in_prompt(monkeypatch, tmp_path: Path):

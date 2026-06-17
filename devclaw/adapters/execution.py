@@ -137,6 +137,42 @@ class CodexCliExecutionAdapter:
                 raise RuntimeError(_tool_error_message(result.stderr or result.stdout))
             return result.stdout
 
+    def plan_workflow(self, intent: str, context_pack: str, workspace: Path) -> str:
+        prompt = _workflow_planner_prompt(intent, context_pack)
+        workspace = workspace.resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+        try:
+            result = run_tool_with_idle_monitor(
+                [
+                    self.codex_bin,
+                    "exec",
+                    "-C",
+                    str(workspace),
+                    "--skip-git-repo-check",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    prompt,
+                ],
+                cwd=workspace,
+                idle_timeout_seconds=self.idle_timeout_seconds,
+                on_output=self._on_tool_output,
+                on_heartbeat=self._on_tool_heartbeat,
+                heartbeat_interval_seconds=60,
+            )
+        except TimeoutError as exc:
+            _write_transcript(workspace, "codex-workflow-planner.txt", prompt, "", str(exc), 124)
+            raise RuntimeError(str(exc)) from exc
+        _write_transcript(
+            workspace,
+            "codex-workflow-planner.txt",
+            prompt,
+            result.stdout,
+            result.stderr,
+            result.returncode,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(_tool_error_message(result.stderr or result.stdout))
+        return result.stdout
+
     def run_role(
         self,
         assignment: RoleAssignment,
@@ -250,6 +286,39 @@ def _write_transcript(
             ]
         ),
         encoding="utf-8",
+    )
+
+
+def _workflow_planner_prompt(intent: str, context_pack: str) -> str:
+    return "\n".join(
+        [
+            "You are the DevClaw Workflow Planner.",
+            "Classify the user's request into the smallest safe workflow.",
+            "Use the context pack to decide whether this is a new project, a targeted follow-up, a bugfix, verification, docs-only, or research-only request.",
+            "Return only JSON. Do not include Markdown, prose, or code fences.",
+            "",
+            "Allowed mode values:",
+            "- full-rd: brand-new or broad product work needing research, PRD, design, architecture, implementation, and verification.",
+            "- targeted-change: localized implementation or performance/UI improvement using existing context.",
+            "- bugfix: localized defect fix.",
+            "- verification: tests, QA, review, or acceptance only.",
+            "- docs-only: documentation or copy-only change.",
+            "- research-only: investigation or research without code changes.",
+            "",
+            "JSON schema:",
+            '{"mode":"targeted-change","reason":"short concrete reason","confidence":0.0}',
+            "",
+            "Routing guidance:",
+            "- If prior context exists and the user asks to optimize, speed up, fix, adjust, improve, or refine an existing page/feature, prefer targeted-change or bugfix.",
+            "- Do not choose full-rd for localized page performance work.",
+            "- Choose full-rd only when the request creates a new product area or requires end-to-end discovery.",
+            "",
+            "# User Request",
+            intent,
+            "",
+            "# Context Pack",
+            context_pack[:12000],
+        ]
     )
 
 

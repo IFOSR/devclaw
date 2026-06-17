@@ -375,6 +375,65 @@ def test_devclaw_loop_uses_targeted_workflow_for_small_follow_up_with_prior_cont
     assert route_events[0]["workflow_mode"] == "targeted-change"
 
 
+def test_devclaw_loop_prefers_codex_planner_for_workflow_routing(tmp_path: Path):
+    first_lead = DevClawLead(
+        execution_adapter=TestExecutionAdapter(),
+        verification_adapter=TestVerificationAdapter(),
+        max_rounds=1,
+    )
+    first_lead.run("Build a customer feedback triage Agent", tmp_path)
+
+    executor = TestExecutionAdapter()
+    verifier = TestVerificationAdapter()
+    executor.planner_outputs.append(
+        '{"mode":"targeted-change","reason":"The request is a localized page performance optimization."}'
+    )
+    events: list[dict[str, str]] = []
+    lead = DevClawLead(
+        execution_adapter=executor,
+        verification_adapter=verifier,
+        max_rounds=1,
+        progress=events.append,
+    )
+
+    result = lead.run("页面太卡顿了，需要的页面加速。", tmp_path)
+
+    assert result.final_report.delivery_status == "delivered"
+    assert "Codex Technical Plan Agent" in executor.role_calls
+    assert "Codex UX Research Agent" not in executor.role_calls
+    assert "Deepseek Product Research Agent" not in verifier.role_calls
+    route_event = next(event for event in events if event["stage"] == "workflow")
+    assert route_event["workflow_mode"] == "targeted-change"
+    assert route_event["mode"] == "codex"
+
+
+def test_devclaw_loop_uses_deepseek_for_context_summary_and_acceptance_checks(tmp_path: Path):
+    executor = TestExecutionAdapter()
+    verifier = TestVerificationAdapter()
+    verifier.context_summaries.append("# Context Summary\n\n- Prior UI performance work is relevant.\n")
+    verifier.generated_checks.append(
+        "def main() -> int:\n"
+        "    return 0\n\n"
+        "if __name__ == \"__main__\":\n"
+        "    raise SystemExit(main())\n"
+    )
+    lead = DevClawLead(
+        execution_adapter=executor,
+        verification_adapter=verifier,
+        max_rounds=1,
+    )
+
+    result = lead.run("页面太卡顿了，需要页面加速。", tmp_path)
+
+    assert result.final_report.delivery_status == "delivered"
+    semantic = tmp_path / ".devclaw" / "context" / "semantic-context-summary.md"
+    assert semantic.exists()
+    assert "Prior UI performance work is relevant" in semantic.read_text(encoding="utf-8")
+    checks = tmp_path / ".devclaw" / "checks" / "acceptance_checks.py"
+    assert checks.exists()
+    assert "return 0" in checks.read_text(encoding="utf-8")
+
+
 def test_devclaw_loop_runs_delivery_after_acceptance_gate(tmp_path: Path):
     events: list[dict[str, str]] = []
     lead = DevClawLead(

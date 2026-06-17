@@ -103,7 +103,7 @@ Every default R&D run is sequential: each Agent starts only after the previous A
 
 Long-running Codex/Deepseek steps emit compact heartbeat lines about once per minute so the terminal shows which Agent is still active without dumping raw tool logs.
 
-Before each run, DevClaw writes `.devclaw/context/current-context-pack.md` from recent memory, session manifests, changed files, and stage document references. Follow-up requests can use an incremental workflow such as `targeted-change` or `bugfix`; reused stages write `stage-reuse-note.md` instead of pretending the full research/PRD/design flow ran again.
+Before each run, DevClaw writes `.devclaw/context/current-context-pack.md` from recent memory, session manifests, changed files, and stage document references. Deepseek then produces `.devclaw/context/semantic-context-summary.md` to select and summarize the context most relevant to the current request. Codex CLI acts as the workflow planner and classifies the request into the smallest safe mode, such as `targeted-change` or `bugfix`; local keyword routing is only a fallback when Codex planning is unavailable. Reused stages write `stage-reuse-note.md` instead of pretending the full research/PRD/design flow ran again.
 
 In interactive terminals, paste a screenshot with `Ctrl+V` or use `/paste-image`; DevClaw shows a pending image count in the prompt and attaches the image to the next requirement.
 
@@ -120,7 +120,8 @@ output so stage artifacts remain auditable.
 - Slash command system.
 - Research-first workflow.
 - Sequential role workflow with per-stage Markdown outputs.
-- Cross-session context pack and incremental workflow routing.
+- Codex-planned workflow routing with cross-session context packs.
+- Deepseek-generated semantic context summaries and acceptance checks.
 - Screenshot attachment from clipboard or file before a run.
 - Persistent prompt history with arrow-key recall across restarts.
 - Recoverable interactive task failures that keep DevClaw running.

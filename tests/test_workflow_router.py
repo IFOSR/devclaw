@@ -1,4 +1,8 @@
-from devclaw.core.workflow_router import WorkflowMode, route_workflow
+from devclaw.core.workflow_router import (
+    WorkflowMode,
+    route_from_planner_output,
+    route_workflow,
+)
 
 
 def test_route_workflow_uses_full_rd_for_new_build_requests():
@@ -57,3 +61,35 @@ def test_route_workflow_keeps_bugfix_narrow_with_prior_context():
         "delivery_report",
         "archivist",
     ]
+
+
+def test_route_workflow_treats_chinese_page_performance_as_targeted_change():
+    route = route_workflow("页面太卡顿了，需要的页面加速。", has_prior_context=True)
+
+    assert route.mode == WorkflowMode.TARGETED_CHANGE
+    assert "product_research" in route.skip_role_keys
+    assert "implementation" in route.run_role_keys
+
+
+def test_route_from_planner_output_parses_codex_json_decision():
+    route = route_from_planner_output(
+        """
+        Codex analysis:
+        {"mode":"targeted-change","reason":"Existing page needs performance optimization.","confidence":0.92}
+        """,
+        has_prior_context=True,
+    )
+
+    assert route.mode == WorkflowMode.TARGETED_CHANGE
+    assert route.reason == "Existing page needs performance optimization."
+    assert "implementation" in route.run_role_keys
+    assert "product_research" in route.skip_role_keys
+
+
+def test_route_from_planner_output_rejects_invalid_planner_output():
+    try:
+        route_from_planner_output('{"mode":"nonsense","reason":"bad"}', has_prior_context=True)
+    except ValueError as error:
+        assert "Unsupported workflow mode" in str(error)
+    else:
+        raise AssertionError("expected ValueError")
