@@ -8,6 +8,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
+def test_redraw_input_line_uses_display_columns_for_wide_characters(capsys):
+    from devclaw.cli import _redraw_input_line
+
+    _redraw_input_line([], list("当前加速"), 2)
+
+    output = capsys.readouterr().out
+    assert output.endswith("\033[4D")
+
+
 def test_default_cli_without_subcommand_runs_interactive_session(tmp_path: Path):
     repo_root = Path(__file__).resolve().parents[1]
     project = tmp_path / "my-product"
@@ -577,6 +586,121 @@ def test_interactive_tty_supports_arrow_key_line_editing(tmp_path: Path):
     assert "Unknown command" not in text
 
 
+def test_interactive_tty_left_arrow_inserts_at_cursor(tmp_path: Path):
+    repo_root = Path(__file__).resolve().parents[1]
+    project = tmp_path / "my-product"
+    project.mkdir()
+    master_fd, slave_fd = pty.openpty()
+    process = subprocess.Popen(
+        [sys.executable, "-m", "devclaw"],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=project,
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    try:
+        output = _read_pty(master_fd, timeout_seconds=1.0)
+        os.write(master_fd, b"/eit")
+        os.write(master_fd, b"\x1b[D")
+        os.write(master_fd, b"\x1b[D")
+        os.write(master_fd, b"x\n")
+        output += _read_pty(master_fd, timeout_seconds=2.0)
+        process.wait(timeout=2)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=2)
+        os.close(master_fd)
+
+    text = output.decode("utf-8", "replace")
+    assert process.returncode == 0, text
+    assert "bye" in text.lower()
+    assert "Unknown command" not in text
+
+
+def test_interactive_tty_right_arrow_moves_cursor_before_backspace(tmp_path: Path):
+    repo_root = Path(__file__).resolve().parents[1]
+    project = tmp_path / "my-product"
+    project.mkdir()
+    master_fd, slave_fd = pty.openpty()
+    process = subprocess.Popen(
+        [sys.executable, "-m", "devclaw"],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=project,
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    try:
+        output = _read_pty(master_fd, timeout_seconds=1.0)
+        os.write(master_fd, b"/exait")
+        os.write(master_fd, b"\x1b[D")
+        os.write(master_fd, b"\x1b[D")
+        os.write(master_fd, b"\x1b[D")
+        os.write(master_fd, b"\x1b[C")
+        os.write(master_fd, b"\x7f\n")
+        output += _read_pty(master_fd, timeout_seconds=2.0)
+        process.wait(timeout=2)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=2)
+        os.close(master_fd)
+
+    text = output.decode("utf-8", "replace")
+    assert process.returncode == 0, text
+    assert "bye" in text.lower()
+    assert "Unknown command" not in text
+
+
+def test_interactive_tty_delete_removes_character_at_cursor(tmp_path: Path):
+    repo_root = Path(__file__).resolve().parents[1]
+    project = tmp_path / "my-product"
+    project.mkdir()
+    master_fd, slave_fd = pty.openpty()
+    process = subprocess.Popen(
+        [sys.executable, "-m", "devclaw"],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=project,
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    try:
+        output = _read_pty(master_fd, timeout_seconds=1.0)
+        os.write(master_fd, b"/exxit")
+        os.write(master_fd, b"\x1b[D")
+        os.write(master_fd, b"\x1b[D")
+        os.write(master_fd, b"\x1b[D")
+        os.write(master_fd, b"\x1b[3~")
+        os.write(master_fd, b"\n")
+        output += _read_pty(master_fd, timeout_seconds=2.0)
+        exited_after_delete = process.poll() is not None
+        if not exited_after_delete:
+            os.write(master_fd, b"/exit\n")
+            output += _read_pty(master_fd, timeout_seconds=1.0)
+        process.wait(timeout=2)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=2)
+        os.close(master_fd)
+
+    text = output.decode("utf-8", "replace")
+    assert process.returncode == 0, text
+    assert exited_after_delete, text
+    assert "bye" in text.lower()
+    assert "Unknown command" not in text
+    assert "~" not in text
+
+
 def test_interactive_tty_up_arrow_recalls_persisted_history(tmp_path: Path):
     repo_root = Path(__file__).resolve().parents[1]
     project = tmp_path / "my-product"
@@ -609,6 +733,47 @@ def test_interactive_tty_up_arrow_recalls_persisted_history(tmp_path: Path):
 
     text = output.decode("utf-8", "replace")
     assert process.returncode == 0, text
+    assert "/exit" in text
+    assert "bye" in text.lower()
+
+
+def test_interactive_tty_application_cursor_up_arrow_recalls_history(tmp_path: Path):
+    repo_root = Path(__file__).resolve().parents[1]
+    project = tmp_path / "my-product"
+    history_dir = project / ".devclaw" / "history"
+    history_dir.mkdir(parents=True)
+    (history_dir / "input-history.txt").write_text("/exit\n", encoding="utf-8")
+    master_fd, slave_fd = pty.openpty()
+    process = subprocess.Popen(
+        [sys.executable, "-m", "devclaw"],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=project,
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    try:
+        output = _read_pty(master_fd, timeout_seconds=1.0)
+        os.write(master_fd, b"\x1bOA")
+        output += _read_pty(master_fd, timeout_seconds=0.5)
+        os.write(master_fd, b"\n")
+        output += _read_pty(master_fd, timeout_seconds=2.0)
+        exited_after_up_arrow = process.poll() is not None
+        if not exited_after_up_arrow:
+            os.write(master_fd, b"/exit\n")
+            output += _read_pty(master_fd, timeout_seconds=1.0)
+        process.wait(timeout=2)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=2)
+        os.close(master_fd)
+
+    text = output.decode("utf-8", "replace")
+    assert process.returncode == 0, text
+    assert exited_after_up_arrow, text
     assert "/exit" in text
     assert "bye" in text.lower()
 

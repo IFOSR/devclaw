@@ -6,6 +6,7 @@ import tty
 import json
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 from devclaw.adapters.execution import CodexCliExecutionAdapter
@@ -191,6 +192,7 @@ def _read_interactive_line(
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     buffer: list[str] = []
+    cursor = 0
     history = input_history or []
     history_index = len(history)
     try:
@@ -207,26 +209,40 @@ def _read_interactive_line(
                 return ""
             if char == "\x16":
                 _paste_image_from_keybinding(args, pending_attachments)
-                print(_prompt(pending_attachments) + "".join(buffer), end="", flush=True)
+                _redraw_input_line(pending_attachments, buffer, cursor)
                 continue
             if char in {"\x7f", "\b"}:
-                if buffer:
-                    buffer.pop()
-                    print("\b \b", end="", flush=True)
+                if cursor > 0:
+                    del buffer[cursor - 1]
+                    cursor -= 1
+                    _redraw_input_line(pending_attachments, buffer, cursor)
                 continue
             if char == "\x1b":
                 sequence = _consume_escape_sequence()
-                if sequence == "[A" and history:
+                if sequence in {"[A", "OA"} and history:
                     history_index = max(0, history_index - 1)
                     buffer = list(history[history_index])
-                    _redraw_input_line(pending_attachments, buffer)
-                elif sequence == "[B" and history:
+                    cursor = len(buffer)
+                    _redraw_input_line(pending_attachments, buffer, cursor)
+                elif sequence in {"[B", "OB"} and history:
                     history_index = min(len(history), history_index + 1)
                     buffer = list(history[history_index]) if history_index < len(history) else []
-                    _redraw_input_line(pending_attachments, buffer)
+                    cursor = len(buffer)
+                    _redraw_input_line(pending_attachments, buffer, cursor)
+                elif sequence in {"[D", "OD"}:
+                    cursor = max(0, cursor - 1)
+                    _redraw_input_line(pending_attachments, buffer, cursor)
+                elif sequence in {"[C", "OC"}:
+                    cursor = min(len(buffer), cursor + 1)
+                    _redraw_input_line(pending_attachments, buffer, cursor)
+                elif sequence == "[3~":
+                    if cursor < len(buffer):
+                        del buffer[cursor]
+                        _redraw_input_line(pending_attachments, buffer, cursor)
                 continue
-            buffer.append(char)
-            print(char, end="", flush=True)
+            buffer.insert(cursor, char)
+            cursor += 1
+            _redraw_input_line(pending_attachments, buffer, cursor)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
@@ -259,15 +275,43 @@ def _print_attachment_notice(attachment: Attachment, pending_attachments: list[A
         print(f"  Note: {attachment.note}")
 
 
-def _redraw_input_line(pending_attachments: list[Attachment], buffer: list[str]) -> None:
-    print("\r\033[2K" + _prompt(pending_attachments) + "".join(buffer), end="", flush=True)
+def _redraw_input_line(
+    pending_attachments: list[Attachment],
+    buffer: list[str],
+    cursor: int | None = None,
+) -> None:
+    cursor = len(buffer) if cursor is None else max(0, min(cursor, len(buffer)))
+    suffix = _display_width("".join(buffer[cursor:]))
+    line = _prompt(pending_attachments) + "".join(buffer)
+    move_left = f"\033[{suffix}D" if suffix else ""
+    print("\r\033[2K" + line + move_left, end="", flush=True)
+
+
+def _display_width(value: str) -> int:
+    width = 0
+    for char in value:
+        if unicodedata.combining(char):
+            continue
+        category = unicodedata.category(char)
+        if category.startswith("C"):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+    return width
 
 
 def _consume_escape_sequence() -> str:
     # Arrow keys and other terminal escapes should not become command text.
     if not sys.stdin.isatty():
         return ""
-    return sys.stdin.read(1) + sys.stdin.read(1)
+    first = sys.stdin.read(1)
+    if first == "[":
+        sequence = first + sys.stdin.read(1)
+        while sequence[-1].isdigit() or sequence[-1] == ";":
+            sequence += sys.stdin.read(1)
+        return sequence
+    if first == "O":
+        return first + sys.stdin.read(1)
+    return first
 
 
 def _load_input_history(workspace: Path) -> list[str]:
