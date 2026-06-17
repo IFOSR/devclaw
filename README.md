@@ -51,6 +51,10 @@ Natural language without `/` is always treated as a current-project R&D request.
 /scaffold <type> <name> Create an agent or CLI scaffold spec.
 /risk                 Create a risk review report.
 /tasks <requirement>  Create a task DAG plan.
+/parallel-run <requirement> Run independent Codex subtasks in parallel.
+/paste-image [note]  Attach the current clipboard image to the next request.
+/attach <path> [note] Attach an image file to the next request.
+/attachments          List pending image attachments.
 /test                 Run detected project tests.
 /quality              Run/show quality report.
 /feedback <content>   Record feedback.
@@ -64,6 +68,12 @@ Natural language without `/` is always treated as a current-project R&D request.
 /run <requirement>    Run one requirement explicitly.
 /exit                 Exit DevClaw.
 ```
+
+Interactive sessions are resilient by design. If a single DevClaw task fails, the
+CLI prints a concise `Task failed` message and returns to the prompt instead of
+exiting the application. Natural-language requests are persisted before the run
+starts, so after a restart you can use the up/down arrow keys to recall earlier
+tasks and retry them.
 
 ## Project Output
 
@@ -79,6 +89,7 @@ DevClaw writes metadata and delivery artifacts under `.devclaw/`:
   memory/
   reports/
   research/
+  stages/<project_id>/<session_id>/
   scaffolds/
   tasks/
   acceptance-contract.json
@@ -88,11 +99,31 @@ DevClaw writes metadata and delivery artifacts under `.devclaw/`:
 
 Delivery docs are written to `.devclaw/delivery/latest/` by default. DevClaw does not overwrite the project root `README.md`.
 
+Every default R&D run is sequential: each Agent starts only after the previous Agent has produced output. Implementation is verified before final release and delivery reports are written. Reviewable Markdown for each phase is written under `.devclaw/stages/<project_id>/<session_id>/`, including `workflow-plan.md` and `index.md`. Parallel execution happens only when you explicitly run `/parallel-run`.
+
+Long-running Codex/Deepseek steps emit compact heartbeat lines about once per minute so the terminal shows which Agent is still active without dumping raw tool logs.
+
+Before each run, DevClaw writes `.devclaw/context/current-context-pack.md` from recent memory, session manifests, changed files, and stage document references. Follow-up requests can use an incremental workflow such as `targeted-change` or `bugfix`; reused stages write `stage-reuse-note.md` instead of pretending the full research/PRD/design flow ran again.
+
+In interactive terminals, paste a screenshot with `Ctrl+V` or use `/paste-image`; DevClaw shows a pending image count in the prompt and attaches the image to the next requirement.
+
+Default role assignment is tuned to each model family: Codex handles intake, UX
+research, architecture reasoning, technical planning, implementation, QA
+verification, and fix loops; Deepseek handles product research, PRD, test
+execution, code review, release review, delivery reporting, and archiving. Each
+role prompt asks the Agent to document skills used, reasoning, evidence, and
+output so stage artifacts remain auditable.
+
 ## Current Capabilities
 
 - Project-local interactive CLI.
 - Slash command system.
 - Research-first workflow.
+- Sequential role workflow with per-stage Markdown outputs.
+- Cross-session context pack and incremental workflow routing.
+- Screenshot attachment from clipboard or file before a run.
+- Persistent prompt history with arrow-key recall across restarts.
+- Recoverable interactive task failures that keep DevClaw running.
 - Agent role specifications.
 - Acceptance Contract generation.
 - DevClaw Lead loop with verification and rework.

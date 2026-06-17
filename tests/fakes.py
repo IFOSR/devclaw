@@ -7,9 +7,28 @@ from pathlib import Path
 from devclaw.adapters.tool_runner import run_tool_with_idle_monitor
 from devclaw.core.context import scan_project_context
 from devclaw.core.models import AcceptanceContract, AgentOutput, ProjectBrief, VerificationReport
+from devclaw.core.role_assignments import RoleAssignment
 
 
 class TestExecutionAdapter:
+    def __init__(self):
+        self.role_calls: list[str] = []
+
+    def run_role(
+        self,
+        assignment: RoleAssignment,
+        brief: ProjectBrief,
+        contract: AcceptanceContract,
+        workspace: Path,
+        previous_outputs: list[AgentOutput],
+    ) -> AgentOutput:
+        self.role_calls.append(assignment.role)
+        return AgentOutput(
+            agent=assignment.role,
+            artifact=assignment.artifact,
+            content=_role_doc(assignment),
+        )
+
     def execute(
         self,
         brief: ProjectBrief,
@@ -30,6 +49,24 @@ class TestExecutionAdapter:
 
 
 class TestVerificationAdapter:
+    def __init__(self):
+        self.role_calls: list[str] = []
+
+    def run_role(
+        self,
+        assignment: RoleAssignment,
+        brief: ProjectBrief,
+        contract: AcceptanceContract,
+        workspace: Path,
+        previous_outputs: list[AgentOutput],
+    ) -> AgentOutput:
+        self.role_calls.append(assignment.role)
+        return AgentOutput(
+            agent=assignment.role,
+            artifact=assignment.artifact,
+            content=_role_doc(assignment),
+        )
+
     def verify(
         self,
         brief: ProjectBrief,
@@ -155,5 +192,25 @@ def _usage_doc(brief: ProjectBrief, contract: AcceptanceContract) -> str:
             "",
             "Acceptance covered:",
             *[f"- {item.id}: {item.description}" for item in contract.blocking_items()],
+        ]
+    )
+
+
+def _role_doc(assignment: RoleAssignment) -> str:
+    return "\n".join(
+        [
+            f"# {assignment.artifact}",
+            "",
+            "## Skills Used",
+            *[f"- {skill}" for skill in assignment.skills],
+            "",
+            "## Reasoning",
+            assignment.mission,
+            "",
+            "## Evidence",
+            f"- Provider: {assignment.provider}",
+            "",
+            "## Output",
+            f"- Stage: {assignment.output_stage}",
         ]
     )

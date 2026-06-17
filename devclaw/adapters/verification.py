@@ -7,7 +7,8 @@ from typing import Callable, Protocol
 
 from devclaw.adapters.tool_runner import run_tool_with_idle_monitor
 from devclaw.core.context import scan_project_context
-from devclaw.core.models import AcceptanceContract, ProjectBrief, VerificationReport
+from devclaw.core.models import AcceptanceContract, AgentOutput, ProjectBrief, VerificationReport
+from devclaw.core.role_assignments import RoleAssignment
 
 
 class VerificationAdapter(Protocol):
@@ -33,6 +34,7 @@ class DeepseekTuiVerificationAdapter:
         self.idle_timeout_seconds = idle_timeout_seconds
         self.progress = progress
         self._emitted_milestones: set[str] = set()
+        self._active_role: RoleAssignment | None = None
 
     def verify(
         self,
@@ -77,6 +79,8 @@ class DeepseekTuiVerificationAdapter:
                 cwd=workspace,
                 idle_timeout_seconds=self.idle_timeout_seconds,
                 on_output=self._on_tool_output,
+                on_heartbeat=self._on_tool_heartbeat,
+                heartbeat_interval_seconds=60,
             )
         except TimeoutError as exc:
             _write_transcript(
@@ -109,6 +113,55 @@ class DeepseekTuiVerificationAdapter:
         _write_transcript(workspace, "deepseek-verification.txt", prompt, result.stdout, result.stderr, result.returncode)
         return parse_deepseek_verification_output(output)
 
+    def run_role(
+        self,
+        assignment: RoleAssignment,
+        brief: ProjectBrief,
+        contract: AcceptanceContract,
+        workspace: Path,
+        previous_outputs: list[AgentOutput],
+    ) -> AgentOutput:
+        prompt = _role_prompt(assignment, brief, contract, workspace, previous_outputs)
+        try:
+            self._active_role = assignment
+            result = run_tool_with_idle_monitor(
+                [
+                    self.deepseek_bin,
+                    "exec",
+                    "--auto",
+                    "--sandbox-mode",
+                    "danger-full-access",
+                    "--approval-policy",
+                    "never",
+                    prompt,
+                ],
+                cwd=workspace,
+                idle_timeout_seconds=self.idle_timeout_seconds,
+                on_output=self._on_tool_output,
+                on_heartbeat=self._on_tool_heartbeat,
+                heartbeat_interval_seconds=60,
+            )
+        except TimeoutError as exc:
+            _write_transcript(workspace, f"{assignment.role.lower().replace(' ', '-')}.txt", prompt, "", str(exc), 124)
+            raise RuntimeError(str(exc)) from exc
+        finally:
+            self._active_role = None
+        _write_transcript(
+            workspace,
+            f"{assignment.role.lower().replace(' ', '-')}.txt",
+            prompt,
+            result.stdout,
+            result.stderr,
+            result.returncode,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr or result.stdout)
+        return AgentOutput(
+            agent=assignment.role,
+            artifact=assignment.artifact,
+            content=result.stdout.strip(),
+        )
+
     def _on_tool_output(self, stream: str, chunk: str) -> None:
         if self.progress is None:
             return
@@ -118,14 +171,29 @@ class DeepseekTuiVerificationAdapter:
             if milestone:
                 self._emit_milestone(milestone)
 
+    def _on_tool_heartbeat(self, elapsed_seconds: float) -> None:
+        if self.progress is None:
+            return
+        role = self._active_role
+        self.progress(
+            {
+                "stage": role.stage if role else "verification",
+                "agent": role.role if role else "Deepseek QA Agent",
+                "status": "heartbeat",
+                "message": "Still running; waiting for the tool to produce the next useful update.",
+                "elapsed_seconds": f"{elapsed_seconds:.1f}",
+            }
+        )
+
     def _emit_milestone(self, message: str) -> None:
         if self.progress is None or message in self._emitted_milestones:
             return
         self._emitted_milestones.add(message)
+        role = self._active_role
         self.progress(
             {
-                "stage": "verification",
-                "agent": "Deepseek QA Agent",
+                "stage": role.stage if role else "verification",
+                "agent": role.role if role else "Deepseek QA Agent",
                 "status": "milestone",
                 "message": message,
             }
@@ -253,4 +321,39 @@ def _write_transcript(
             ]
         ),
         encoding="utf-8",
+    )
+
+
+def _role_prompt(
+    assignment: RoleAssignment,
+    brief: ProjectBrief,
+    contract: AcceptanceContract,
+    workspace: Path,
+    previous_outputs: list[AgentOutput],
+) -> str:
+    return "\n".join(
+        [
+            f"You are {assignment.role}.",
+            f"Provider: {assignment.provider}.",
+            f"Workspace: {workspace}",
+            f"Goal: {brief.goal}",
+            "",
+            "Mission:",
+            assignment.mission,
+            "",
+            "Skills to use:",
+            *[f"- {skill}" for skill in assignment.skills],
+            "",
+            "Acceptance:",
+            *[f"- {item.id}: {item.description}" for item in contract.blocking_items()],
+            "",
+            "Previous stage outputs:",
+            *[f"- {output.agent}: {output.artifact}" for output in previous_outputs],
+            "",
+            "Return Markdown only. Include these sections:",
+            "## Skills Used",
+            "## Reasoning",
+            "## Evidence",
+            "## Output",
+        ]
     )

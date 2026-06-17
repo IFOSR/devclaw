@@ -38,8 +38,10 @@ def test_start_script_chat_opens_interactive_cli(tmp_path: Path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "DevClaw interactive" in result.stdout
-    assert "Project:" in result.stdout
+    assert "DevClaw" in result.stdout
+    assert "Project" in result.stdout
+    assert "Mode" in result.stdout
+    assert "devclaw ›" in result.stdout
 
 
 def test_stop_script_is_idempotent_without_running_process(tmp_path: Path):

@@ -6,6 +6,7 @@ from typing import Callable, Protocol
 
 from devclaw.adapters.tool_runner import ToolExecutionResult, run_tool_with_idle_monitor
 from devclaw.core.models import AcceptanceContract, AgentOutput, ProjectBrief
+from devclaw.core.role_assignments import RoleAssignment
 
 
 class ExecutionAdapter(Protocol):
@@ -35,6 +36,7 @@ class CodexCliExecutionAdapter:
         self.idle_timeout_seconds = idle_timeout_seconds
         self.progress = progress
         self._emitted_milestones: set[str] = set()
+        self._active_role: RoleAssignment | None = None
 
     def execute(
         self,
@@ -71,6 +73,8 @@ class CodexCliExecutionAdapter:
                 cwd=workspace,
                 idle_timeout_seconds=self.idle_timeout_seconds,
                 on_output=self._on_tool_output,
+                on_heartbeat=self._on_tool_heartbeat,
+                heartbeat_interval_seconds=60,
             )
         except TimeoutError as exc:
             _write_transcript(
@@ -84,7 +88,7 @@ class CodexCliExecutionAdapter:
             raise RuntimeError(str(exc)) from exc
         if result.returncode != 0:
             _write_transcript(workspace, "codex-execution.txt", prompt, result.stdout, result.stderr, result.returncode)
-            raise RuntimeError(result.stderr or result.stdout)
+            raise RuntimeError(_tool_error_message(result.stderr or result.stdout))
         _write_transcript(workspace, "codex-execution.txt", prompt, result.stdout, result.stderr, result.returncode)
         if _looks_like_confirmation_request(result.stdout) and not _looks_like_delivery(workspace):
             raise RuntimeError(
@@ -114,6 +118,8 @@ class CodexCliExecutionAdapter:
                 cwd=workspace,
                 idle_timeout_seconds=self.idle_timeout_seconds,
                 on_output=self._on_tool_output,
+                on_heartbeat=self._on_tool_heartbeat,
+                heartbeat_interval_seconds=60,
             )
         except TimeoutError as exc:
             _write_transcript(
@@ -128,8 +134,56 @@ class CodexCliExecutionAdapter:
         else:
             _write_transcript(workspace, "codex-execution.txt", prompt, result.stdout, result.stderr, result.returncode)
             if result.returncode != 0:
-                raise RuntimeError(result.stderr or result.stdout)
+                raise RuntimeError(_tool_error_message(result.stderr or result.stdout))
             return result.stdout
+
+    def run_role(
+        self,
+        assignment: RoleAssignment,
+        brief: ProjectBrief,
+        contract: AcceptanceContract,
+        workspace: Path,
+        previous_outputs: list[AgentOutput],
+    ) -> AgentOutput:
+        prompt = _role_prompt(assignment, brief, contract, workspace, previous_outputs)
+        try:
+            self._active_role = assignment
+            result = run_tool_with_idle_monitor(
+                [
+                    self.codex_bin,
+                    "exec",
+                    "-C",
+                    str(workspace),
+                    "--skip-git-repo-check",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    prompt,
+                ],
+                cwd=workspace,
+                idle_timeout_seconds=self.idle_timeout_seconds,
+                on_output=self._on_tool_output,
+                on_heartbeat=self._on_tool_heartbeat,
+                heartbeat_interval_seconds=60,
+            )
+        except TimeoutError as exc:
+            _write_transcript(workspace, f"{assignment.role.lower().replace(' ', '-')}.txt", prompt, "", str(exc), 124)
+            raise RuntimeError(str(exc)) from exc
+        finally:
+            self._active_role = None
+        _write_transcript(
+            workspace,
+            f"{assignment.role.lower().replace(' ', '-')}.txt",
+            prompt,
+            result.stdout,
+            result.stderr,
+            result.returncode,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(_tool_error_message(result.stderr or result.stdout))
+        return AgentOutput(
+            agent=assignment.role,
+            artifact=assignment.artifact,
+            content=result.stdout.strip(),
+        )
 
     def _on_tool_output(self, stream: str, chunk: str) -> None:
         if self.progress is None:
@@ -140,14 +194,29 @@ class CodexCliExecutionAdapter:
             if milestone:
                 self._emit_milestone(milestone)
 
+    def _on_tool_heartbeat(self, elapsed_seconds: float) -> None:
+        if self.progress is None:
+            return
+        role = self._active_role
+        self.progress(
+            {
+                "stage": role.stage if role else "implementation",
+                "agent": role.role if role else "Codex Implementation Agent",
+                "status": "heartbeat",
+                "message": "Still running; waiting for the tool to produce the next useful update.",
+                "elapsed_seconds": f"{elapsed_seconds:.1f}",
+            }
+        )
+
     def _emit_milestone(self, message: str) -> None:
         if self.progress is None or message in self._emitted_milestones:
             return
         self._emitted_milestones.add(message)
+        role = self._active_role
         self.progress(
             {
-                "stage": "implementation",
-                "agent": "Codex Implementation Agent",
+                "stage": role.stage if role else "implementation",
+                "agent": role.role if role else "Codex Implementation Agent",
                 "status": "milestone",
                 "message": message,
             }
@@ -182,6 +251,51 @@ def _write_transcript(
         ),
         encoding="utf-8",
     )
+
+
+def _role_prompt(
+    assignment: RoleAssignment,
+    brief: ProjectBrief,
+    contract: AcceptanceContract,
+    workspace: Path,
+    previous_outputs: list[AgentOutput],
+) -> str:
+    return "\n".join(
+        [
+            f"You are {assignment.role}.",
+            f"Provider: {assignment.provider}.",
+            f"Workspace: {workspace}",
+            f"Goal: {brief.goal}",
+            "",
+            "Mission:",
+            assignment.mission,
+            "",
+            "Skills to use:",
+            *[f"- {skill}" for skill in assignment.skills],
+            "",
+            "Acceptance:",
+            *[f"- {item.id}: {item.description}" for item in contract.blocking_items()],
+            "",
+            "Previous stage outputs:",
+            *[f"- {output.agent}: {output.artifact}" for output in previous_outputs],
+            "",
+            "Return Markdown only. Include these sections:",
+            "## Skills Used",
+            "## Reasoning",
+            "## Evidence",
+            "## Output",
+        ]
+    )
+
+
+def _tool_error_message(output: str) -> str:
+    text = output.strip() or "Tool failed without output."
+    lowered = text.lower()
+    if "concurrency limit exceeded" in lowered:
+        return f"TOOL_RETRYABLE: Codex concurrency limit exceeded. Retry later or stop other Codex sessions. Detail: {text}"
+    if "stream disconnected before completion" in lowered:
+        return f"TOOL_RETRYABLE: Codex stream disconnected before completion. Retry later. Detail: {text}"
+    return text
 
 
 def _looks_like_confirmation_request(output: str) -> bool:

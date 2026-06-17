@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -100,3 +101,45 @@ def test_tool_runner_streams_stdout_and_stderr_chunks_to_progress_callback(tmp_p
     assert result.returncode == 0
     assert ("stdout", "out-1\n") in chunks
     assert ("stderr", "err-1\n") in chunks
+
+
+def test_tool_runner_handles_utf8_character_split_across_nonblocking_reads(tmp_path):
+    result = run_tool_with_idle_monitor(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, sys, time\n"
+                "os.write(sys.stdout.fileno(), b'a' * 65535 + bytes([0xe6]))\n"
+                "sys.stdout.flush()\n"
+                "time.sleep(0.2)\n"
+                "os.write(sys.stdout.fileno(), bytes([0x9c, 0xac]) + b'\\n')\n"
+            ),
+        ],
+        cwd=tmp_path,
+        idle_timeout_seconds=1,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.endswith("本\n")
+
+
+def test_tool_runner_emits_periodic_heartbeat_while_process_is_active(tmp_path):
+    heartbeats: list[float] = []
+
+    result = run_tool_with_idle_monitor(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(0.35); print('done', flush=True)",
+        ],
+        cwd=tmp_path,
+        idle_timeout_seconds=1,
+        heartbeat_interval_seconds=0.1,
+        on_heartbeat=lambda elapsed: heartbeats.append(elapsed),
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "done"
+    assert heartbeats
+    assert all(elapsed >= 0 for elapsed in heartbeats)

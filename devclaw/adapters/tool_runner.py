@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import codecs
 import os
 import select
 import subprocess
@@ -23,6 +24,8 @@ def run_tool_with_idle_monitor(
     idle_timeout_seconds: float,
     env: dict[str, str] | None = None,
     on_output: Callable[[str, str], None] | None = None,
+    on_heartbeat: Callable[[float], None] | None = None,
+    heartbeat_interval_seconds: float = 60,
 ) -> ToolExecutionResult:
     process_env = None
     if env is not None:
@@ -31,11 +34,10 @@ def run_tool_with_idle_monitor(
         cmd,
         cwd=cwd,
         env=process_env,
-        text=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        bufsize=1,
+        bufsize=0,
     )
     assert process.stdout is not None
     assert process.stderr is not None
@@ -44,7 +46,11 @@ def run_tool_with_idle_monitor(
 
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
+    stdout_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    stderr_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    started_at = time.monotonic()
     last_output = time.monotonic()
+    last_heartbeat = started_at
 
     while True:
         ready, _, _ = select.select(
@@ -55,25 +61,36 @@ def run_tool_with_idle_monitor(
         )
         saw_output = False
         for stream in ready:
-            chunk = stream.read()
-            if not chunk:
+            raw_chunk = stream.read()
+            if not raw_chunk:
                 continue
             saw_output = True
             if stream is process.stdout:
+                chunk = stdout_decoder.decode(raw_chunk, final=False)
                 stdout_parts.append(chunk)
                 if on_output is not None:
                     on_output("stdout", chunk)
             else:
+                chunk = stderr_decoder.decode(raw_chunk, final=False)
                 stderr_parts.append(chunk)
                 if on_output is not None:
                     on_output("stderr", chunk)
         if saw_output:
             last_output = time.monotonic()
+        now = time.monotonic()
+
+        if (
+            on_heartbeat is not None
+            and heartbeat_interval_seconds > 0
+            and now - last_heartbeat >= heartbeat_interval_seconds
+        ):
+            on_heartbeat(now - started_at)
+            last_heartbeat = now
 
         returncode = process.poll()
         if returncode is not None:
-            stdout_parts.append(process.stdout.read() or "")
-            stderr_parts.append(process.stderr.read() or "")
+            stdout_parts.append(stdout_decoder.decode(process.stdout.read() or b"", final=True))
+            stderr_parts.append(stderr_decoder.decode(process.stderr.read() or b"", final=True))
             return ToolExecutionResult(
                 returncode=returncode,
                 stdout="".join(stdout_parts),
