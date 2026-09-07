@@ -14,6 +14,7 @@ from fnmatch import fnmatch
 from typing import Iterable, Mapping
 
 from metacoding.models import PlannerPlan, TesterReport
+from metacoding.project import GIT_META_PREFIX
 
 BLOCKING_SEVERITIES = ("P0", "P1")
 
@@ -33,7 +34,11 @@ TESTER_ALLOWED_FILES = ("docs/metacoding/TEST_REPORT.md",)
 
 def is_host_protected(path: str) -> bool:
     """True when a path is protected by the host itself, not the planner."""
-    return path in HOST_PROTECTED_FILES or path.startswith(HOST_PROTECTED_PREFIXES)
+    return (
+        path in HOST_PROTECTED_FILES
+        or path.startswith(HOST_PROTECTED_PREFIXES)
+        or path.startswith(GIT_META_PREFIX)
+    )
 
 
 @dataclass(frozen=True)

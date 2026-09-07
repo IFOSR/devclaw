@@ -159,41 +159,78 @@ class ProjectConfig:
     def from_dict(cls, snapshot: dict) -> "ProjectConfig":
         """Rebuild a config from a persisted run snapshot (used on resume).
 
-        The snapshot goes through the same validation as a loaded config
-        file, so a corrupted or tampered snapshot cannot smuggle invalid
-        providers, limits, or forbidden harness arguments into a resume.
+        Snapshots are the host's own ``to_dict`` output; anything missing or
+        invalid is treated as corruption or tampering and rejected. No
+        defaults are filled in and callers must not fall back to the current
+        config file when this raises.
         """
         if not isinstance(snapshot, dict):
             raise ConfigError("config snapshot must be an object")
-        base = default_config()
         _check_secrets(snapshot)
 
-        schema_version = snapshot.get("schema_version", base.schema_version)
+        def require(mapping, key: str, what: str):
+            if not isinstance(mapping, dict) or key not in mapping:
+                raise ConfigError(f"config snapshot is missing {what}")
+            return mapping[key]
+
+        schema_version = require(snapshot, "schema_version", "'schema_version'")
         if not isinstance(schema_version, int) or schema_version != SCHEMA_VERSION:
             raise ConfigError(
                 f"snapshot has unsupported schema_version {schema_version!r}; "
                 f"expected {SCHEMA_VERSION}"
             )
 
-        harness_raw = snapshot.get("harness", {})
+        harness_raw = require(snapshot, "harness", "'harness'")
         if not isinstance(harness_raw, dict):
             raise ConfigError("snapshot 'harness' must be an object")
+        for name in ("planner", "coder", "tester"):
+            section = require(harness_raw, name, f"'harness.{name}'")
+            if not isinstance(section, dict):
+                raise ConfigError(f"snapshot 'harness.{name}' must be an object")
+            for field in ("provider", "command", "model", "extra_args"):
+                require(section, field, f"'harness.{name}.{field}'")
         # _merge_harness validates providers, commands, models, extra_args.
-        harness = _merge_harness(base.harness, harness_raw)
+        harness = _merge_harness(default_config().harness, harness_raw)
 
-        limits_raw = snapshot.get("limits", {})
-        # Reuse _merge_limits by feeding the raw snapshot values through it.
+        limits_raw = require(snapshot, "limits", "'limits'")
+        for field in (
+            "max_rounds",
+            "same_failure_limit",
+            "idle_timeout_seconds",
+            "max_execution_seconds",
+        ):
+            require(limits_raw, field, f"'limits.{field}'")
         merged_limits = _merge_limits(
-            base.limits,
-            limits_raw if isinstance(limits_raw, dict) else {},
+            default_config().limits, limits_raw if isinstance(limits_raw, dict) else {}
         )
-        policy_raw = snapshot.get("policy", {})
+
+        policy_raw = require(snapshot, "policy", "'policy'")
+        for field in (
+            "allow_network",
+            "allow_destructive_commands",
+            "tester_can_modify_source",
+        ):
+            require(policy_raw, field, f"'policy.{field}'")
         policy = _merge_policy(
-            base.policy, policy_raw if isinstance(policy_raw, dict) else {}
+            default_config().policy, policy_raw if isinstance(policy_raw, dict) else {}
         )
-        github_raw = snapshot.get("github", {})
+
+        github_raw = require(snapshot, "github", "'github'")
+        for field in (
+            "enabled",
+            "remote",
+            "mode",
+            "branch_prefix",
+            "auto_commit",
+            "auto_push",
+            "auto_create_pr",
+            "wait_for_checks",
+            "check_timeout_seconds",
+            "check_poll_seconds",
+        ):
+            require(github_raw, field, f"'github.{field}'")
         github = _merge_github(
-            base.github, github_raw if isinstance(github_raw, dict) else {}
+            default_config().github, github_raw if isinstance(github_raw, dict) else {}
         )
         return cls(
             schema_version=schema_version,

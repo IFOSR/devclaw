@@ -308,7 +308,9 @@ def test_tester_contamination_blocks_e2e(tmp_path: Path) -> None:
     run_dir = next((root / ".metacoding" / "runs").iterdir())
     final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
     assert final["outcome"] == "blocked"
-    assert "contaminat" in final["reason"].lower()
+    reason = final["reason"].lower()
+    assert "contaminat" in reason or "permitted scope" in reason
+    assert "src/audit.py" in final["reason"]
 
 
 def test_resume_completes_persisted_run_e2e(tmp_path: Path) -> None:

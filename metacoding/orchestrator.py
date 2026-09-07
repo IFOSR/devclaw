@@ -54,6 +54,7 @@ from metacoding.project import (
     detect_test_commands,
     detect_workspace_changes,
     git_invariant,
+    runtime_evidence_state,
     workspace_state,
 )
 
@@ -304,16 +305,19 @@ class Orchestrator:
         harness_label: str,
         pre_state: dict[str, str],
         pre_git: tuple[str | None, str | None],
+        pre_evidence: dict[str, str],
         *,
         stage_payload_files: set[str],
         stage_prefixes: tuple[str, ...],
         allowed_patterns: tuple[str, ...],
     ) -> None:
-        """Enforce per-stage write and git invariants after a harness ran.
+        """Enforce per-stage write, git, and evidence invariants.
 
         Raises :class:`StageViolation` when the harness wrote outside its
-        permitted scope or performed git operations. Git history and the
-        branch may only be changed by the host's delivery stage.
+        permitted scope, performed git operations, or modified runtime
+        evidence (run.json, round records, plan, git artifacts) that only
+        the host may write. Git history and the branch may only be changed
+        by the host's delivery stage.
         """
         post_git = git_invariant(self.project_root)
         if post_git != pre_git:
@@ -337,6 +341,25 @@ class Orchestrator:
                 f"{harness_label} wrote outside its permitted scope: "
                 f"{', '.join(gate.details)}"
             )
+        # Runtime evidence (run.json, rounds, plan, git/, final.json,
+        # state.json, lock) is invisible to git status and the inventory;
+        # verify it with an independent hash snapshot.
+        evidence_changed = detect_workspace_changes(
+            pre_evidence,
+            runtime_evidence_state(self.project_root, record.run_id),
+            ignore_prefixes=(),
+        )
+        transcripts_prefix = f".metacoding/runs/{record.run_id}/transcripts/"
+        tampered = sorted(
+            path
+            for path in evidence_changed
+            if path not in stage_payload_files
+            and not path.startswith(transcripts_prefix)
+        )
+        if tampered:
+            raise StageViolation(
+                f"{harness_label} modified runtime evidence: {', '.join(tampered)}"
+            )
 
     def _ensure_plan(self, record: RunRecord, force: bool = False) -> PlannerPlan:
         existing = self.store.load_plan(record.run_id)
@@ -348,6 +371,7 @@ class Orchestrator:
         report_dir = self.store.run_dir(record.run_id)
         pre_state = workspace_state(self.project_root)
         pre_git = git_invariant(self.project_root)
+        pre_evidence = runtime_evidence_state(self.project_root, record.run_id)
         plan = self._invoke(
             "planner",
             "plan",
@@ -360,6 +384,7 @@ class Orchestrator:
             "planner",
             pre_state,
             pre_git,
+            pre_evidence,
             stage_payload_files={
                 f".metacoding/runs/{record.run_id}/plan-payload.json",
                 f".metacoding/runs/{record.run_id}/plan-payload.last-message",
@@ -410,6 +435,7 @@ class Orchestrator:
         round_dir = self.store.round_dir(record.run_id, round_number)
         pre_state = workspace_state(self.project_root)
         pre_git = git_invariant(self.project_root)
+        pre_evidence = runtime_evidence_state(self.project_root, record.run_id)
         coding = self._invoke(
             "coder",
             "code",
@@ -426,6 +452,7 @@ class Orchestrator:
             "coder",
             pre_state,
             pre_git,
+            pre_evidence,
             stage_payload_files={
                 f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/code-payload.json",
                 f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/code-payload.last-message",
@@ -497,6 +524,7 @@ class Orchestrator:
         round_dir = self.store.round_dir(record.run_id, round_number)
         pre_state = workspace_state(self.project_root)
         pre_git = git_invariant(self.project_root)
+        pre_evidence = runtime_evidence_state(self.project_root, record.run_id)
         report = self._invoke(
             "tester",
             "test",
@@ -517,26 +545,35 @@ class Orchestrator:
                 f"(head/branch {pre_git} -> {post_git}); harnesses must not "
                 f"commit, merge, or switch branches"
             )
+        # Runtime evidence check: the tester may only add its own payload
+        # files and transcripts; touching run.json, the plan, coding reports,
+        # decisions, earlier rounds, or git/ artifacts is tampering.
+        tester_payload_files = {
+            f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/test-payload.json",
+            f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/test-payload.last-message",
+        }
+        self._guard_stage_writes(
+            record,
+            "tester",
+            pre_state,
+            pre_git,
+            pre_evidence,
+            stage_payload_files=set(tester_payload_files),
+            stage_prefixes=(f".metacoding/runs/{record.run_id}/transcripts/",),
+            allowed_patterns=(),
+        )
         round_record.tester_report = report
         self.store.save_round(record.run_id, round_record)
         self._render_test_report(record.run_id, report, round_number)
 
-        # The tester may only write its own payload files, the transcripts,
-        # and TEST_REPORT.md — never run.json, the plan, earlier rounds, or
-        # the git/ evidence directory.
+        # Workspace check: the tester may only write its own payload files,
+        # the transcripts, and TEST_REPORT.md — never product source.
         contamination = contamination_gate(
             pre_state,
             post_state,
             tester_can_modify_source=self.config.policy.tester_can_modify_source,
-            allowed_prefixes=(
-                f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/",
-                f".metacoding/runs/{record.run_id}/transcripts/",
-            ),
-            allowed_files=(
-                f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/test-payload.json",
-                f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/test-payload.last-message",
-                "docs/metacoding/TEST_REPORT.md",
-            ),
+            allowed_prefixes=(f".metacoding/runs/{record.run_id}/transcripts/",),
+            allowed_files=tuple(tester_payload_files) + ("docs/metacoding/TEST_REPORT.md",),
         )
         if not contamination.passed:
             stop = self._finalize(
@@ -619,6 +656,7 @@ class Orchestrator:
         round_dir = self.store.round_dir(record.run_id, round_number)
         pre_state = workspace_state(self.project_root)
         pre_git = git_invariant(self.project_root)
+        pre_evidence = runtime_evidence_state(self.project_root, record.run_id)
         decision = self._invoke(
             "planner",
             "review",
@@ -637,6 +675,7 @@ class Orchestrator:
             "planner review",
             pre_state,
             pre_git,
+            pre_evidence,
             stage_payload_files={
                 f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/review-payload.json",
                 f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/review-payload.last-message",
@@ -851,45 +890,61 @@ class Orchestrator:
                 f"known limitation: {item}"
                 for item in round_record.coding_result.known_limitations
             )
-        result = self._finalize(
+        final = self._build_final(
             record,
-            RunStatus.DELIVERED,
+            RunStatus.DELIVERED.value,
             reason or "planner accepted the implementation",
             f"All gates passed after {record.current_round} round(s).",
-            warnings=warnings,
-            github=github_result,
+            warnings,
+            github_result,
         )
-        self._update_final_report_on_branch(record, github_result, warnings)
-        return result
+        final.warnings.extend(
+            note for note in self._collect_round_notes() if note not in final.warnings
+        )
+        # Commit the COMPLETE final report to the delivery branch before the
+        # run is finalized, so a failure here is recorded in final.json and
+        # the rendered report instead of being lost after "delivered".
+        self._commit_final_report_to_branch(record, github_result, final)
+        return self._finish(record, RunStatus.DELIVERED, final)
 
-    def _update_final_report_on_branch(
-        self, record: RunRecord, github_result: dict | None, warnings: list[str]
+    def _commit_final_report_to_branch(
+        self, record: RunRecord, github_result: dict | None, final: FinalReport
     ) -> None:
-        """Commit the completed FINAL_REPORT.md to the delivery branch.
+        """Render the complete FINAL_REPORT.md and commit it to the branch.
 
-        The first commit carries the report with a pending github section;
-        after delivery the real section is rendered and appended as a second
-        commit so the branch always contains the report the PR body links.
+        The first delivery commit carries the placeholder version; this adds
+        the complete report (with the real github section) as a follow-up
+        commit so the PR body link always resolves. Outcome is recorded in
+        the delivery artifact and as a final-report warning on failure.
         """
-        if (
-            not github_result
-            or not github_result.get("commit")
-            or self.deliverer is None
-        ):
+        if not github_result or not github_result.get("commit") or self.deliverer is None:
             return
+        self._render_final_report(final)
+        outcome = {"committed": False, "commit": None}
         try:
             update = self.deliverer.deliver(
                 record.run_id, ["docs/metacoding/FINAL_REPORT.md"]
             ) or {}
+            outcome = {
+                "committed": bool(update.get("commit")),
+                "commit": update.get("commit"),
+            }
         except MetaCodingError as exc:
-            warnings.append(f"final report not committed to branch: {exc}")
-            return
+            outcome = {"committed": False, "commit": None, "error": str(exc)}
+        if not outcome["committed"]:
+            warning = (
+                "final report could not be committed to the delivery branch; "
+                f"the branch may hold the placeholder version ({outcome.get('error', 'no new commit')})"
+            )
+            final.warnings.append(warning)
+            github_result["final_report"] = outcome
+        else:
+            github_result["final_report"] = outcome
         artifact = self.store.load_git_artifact(record.run_id, "delivery") or {}
-        artifact["final_report"] = {
-            "committed": bool(update.get("commit")),
-            "commit": update.get("commit"),
-        }
+        artifact["final_report"] = outcome
         self.store.save_git_artifact(record.run_id, "delivery", artifact)
+        # final.json is written by _finish after this call, so the outcome
+        # above is reflected in both the artifact and the report.
 
     # --- harness invocation with retry ----------------------------------------------
 
@@ -1009,14 +1064,18 @@ class Orchestrator:
         final.warnings.extend(
             note for note in self._collect_round_notes() if note not in final.warnings
         )
+        return self._finish(record, status, final)
+
+    def _finish(self, record: RunRecord, status: RunStatus, final: FinalReport) -> OrchestratorResult:
+        """Persist the final report, terminal status, and done event."""
         self.store.save_final(record.run_id, final)
         self._render_final_report(final)
         record.status = status
         self.store.save_run(record)
         self.store.clear_active_run()
-        self._phase("done", f"Run finished as {status.value}: {reason}")
+        self._phase("done", f"Run finished as {status.value}: {final.reason}")
         return OrchestratorResult(
-            record.run_id, status, final, EXIT_BY_STATUS.get(status, 1), reason
+            record.run_id, status, final, EXIT_BY_STATUS.get(status, 1), final.reason
         )
 
     # --- human-readable documents -------------------------------------------------------

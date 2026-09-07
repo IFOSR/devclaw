@@ -69,8 +69,8 @@ def test_second_run_rejected_while_lock_held(tmp_path: Path) -> None:
 
 
 def test_release_allows_next_run(tmp_path: Path) -> None:
-    acquire_lock(tmp_path, "run-1")
-    release_lock(tmp_path)
+    handle = acquire_lock(tmp_path, "run-1")
+    assert handle.release() is True
     with project_lock(tmp_path, "run-2"):
         assert read_lock(tmp_path) is not None
 
@@ -200,11 +200,26 @@ def test_release_never_deletes_a_successors_lock(tmp_path: Path) -> None:
     assert read_lock(tmp_path).run_id == "new-run"
 
 
-def test_release_lock_verifies_expected_owner(tmp_path: Path) -> None:
+def test_release_lock_cas_for_external_cleanup(tmp_path: Path) -> None:
+    # release_lock is for an external process cleaning up a lock whose owner
+    # is gone (no flock held). While the owner holds the flock it must fail.
     with project_lock(tmp_path, "run-1"):
-        # wrong expected pid: untouched
-        assert release_lock(tmp_path, expected_pid=999999) is False
-        assert read_lock(tmp_path) is not None
-        # matching owner: removed
-        assert release_lock(tmp_path, expected_pid=os.getpid()) is True
-        assert read_lock(tmp_path) is None
+        assert release_lock(
+            tmp_path, expected_pid=os.getpid(), expected_run_id="run-1"
+        ) is False  # owner still holds the flock
+    assert read_lock(tmp_path) is None
+
+    # orphaned lock (no flock held): owner must match exactly
+    write_lock(
+        tmp_path,
+        {
+            "run_id": "orphan",
+            "pid": 4242,
+            "host": socket.gethostname(),
+            "acquired_at": "2026-09-07T00:00:00Z",
+        },
+    )
+    assert release_lock(tmp_path, expected_pid=4242, expected_run_id="other") is False
+    assert read_lock(tmp_path) is not None
+    assert release_lock(tmp_path, expected_pid=4242, expected_run_id="orphan") is True
+    assert read_lock(tmp_path) is None

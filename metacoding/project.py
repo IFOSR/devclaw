@@ -29,7 +29,24 @@ EXCLUDED_DIR_NAMES = {
 #: Paths under ``.metacoding`` that are runtime-generated state.
 EXCLUDED_METACODING_PARTS = ("runs", "transcripts", "logs", "github")
 
+#: Volatile cache directories that legitimately appear while harnesses run
+#: checks; their creation is not treated as a write violation.
+VOLATILE_IGNORED_DIRS = (
+    ".pytest_cache",
+    "__pycache__",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    "node_modules",
+    ".venv",
+    "venv",
+    "htmlcov",
+)
 MAX_INVENTORY_ENTRIES = 2000
+MAX_IGNORED_ENTRIES = 2000
+
+#: Pseudo-key prefix for git metadata fingerprints inside workspace_state.
+GIT_META_PREFIX = "@git/"
 
 
 def _git(root: Path, *args: str) -> tuple[int, str]:
@@ -146,6 +163,90 @@ def git_invariant(project_root: Path) -> tuple[str | None, str | None]:
     return (head or None, branch or None)
 
 
+def _git_meta_state(root: Path) -> dict[str, str]:
+    """Fingerprints of git internals a harness must never touch.
+
+    Covers .git/config, every hook, and the branch/ref layout. The index is
+    deliberately excluded: read-only commands like ``git status`` may
+    opportunistically refresh it, so hashing it would false-positive.
+    """
+    git_dir = root / ".git"
+    if not git_dir.is_dir():
+        return {}
+    state: dict[str, str] = {}
+
+    def digest(path: Path) -> str:
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return "<unreadable>"
+
+    config = git_dir / "config"
+    if config.is_file():
+        state[f"{GIT_META_PREFIX}config"] = digest(config)
+    hooks_dir = git_dir / "hooks"
+    if hooks_dir.is_dir():
+        for hook in sorted(hooks_dir.iterdir()):
+            if hook.is_file() and not hook.name.endswith(".sample"):
+                state[f"{GIT_META_PREFIX}hooks/{hook.name}"] = digest(hook)
+    code, output = _git(root, "for-each-ref", "refs/heads", "--format=%(refname) %(objectname)")
+    if code == 0:
+        state[f"{GIT_META_PREFIX}refs"] = hashlib.sha256(
+            output.strip().encode("utf-8")
+        ).hexdigest()
+    return state
+
+
+def _ignored_presence(root: Path) -> dict[str, str]:
+    """Presence markers for gitignored product files (name-level only).
+
+    Content changes inside ignored files remain a documented limitation;
+    creating or deleting one (e.g. a leaked secret file) is detected.
+    """
+    code, output = _git(
+        root, "ls-files", "--others", "--ignored", "--exclude-standard"
+    )
+    if code != 0:
+        return {}
+    markers: dict[str, str] = {}
+    for line in output.splitlines():
+        path = _normalize(line)
+        if not path or path.startswith(".metacoding/"):
+            continue
+        if any(part in VOLATILE_IGNORED_DIRS for part in path.split("/")):
+            continue
+        markers[path] = ""
+        if len(markers) >= MAX_IGNORED_ENTRIES:
+            break
+    return markers
+
+
+def runtime_evidence_state(project_root: Path, run_id: str) -> dict[str, str]:
+    """Hash every runtime evidence file of a run plus host state files.
+
+    Covers ``.metacoding/runs/<run-id>/**`` (run.json, plan, rounds, git
+    artifacts, final), ``.metacoding/state.json``, and the lock file — none
+    of which appear in git status or the business inventory.
+    """
+    root = Path(project_root)
+    state: dict[str, str] = {}
+    run_root = root / ".metacoding" / "runs" / run_id
+    for base, names in ((run_root, None), (root / ".metacoding", ("state.json", "active-run.lock"))):
+        if names is not None:
+            paths = [base / name for name in names if (base / name).is_file()]
+        else:
+            if not base.is_dir():
+                continue
+            paths = [p for p in sorted(base.rglob("*")) if p.is_file()]
+        for path in paths:
+            relative = path.relative_to(root).as_posix()
+            try:
+                state[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                state[relative] = "<unreadable>"
+    return state
+
+
 def workspace_state(project_root: Path) -> dict[str, str]:
     """Ground-truth workspace state as ``path -> content hash``.
 
@@ -159,6 +260,8 @@ def workspace_state(project_root: Path) -> dict[str, str]:
         state: dict[str, str] = {}
         for path in current_dirty_files(root):
             state[path] = _file_hash(root / path)
+        state.update(_git_meta_state(root))
+        state.update(_ignored_presence(root))
         return state
     return {path: _file_hash(root / path) for path in _inventory(root)}
 

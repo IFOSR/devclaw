@@ -100,7 +100,9 @@ class GhClient:
         "fail": "FAILURE",
         "failure": "FAILURE",
         "failed": "FAILURE",
+        "error": "FAILURE",
         "pending": "PENDING",
+        "queued": "PENDING",
         "cancel": "CANCELLED",
         "cancelled": "CANCELLED",
         "skipping": "SKIPPED",
@@ -179,10 +181,16 @@ class GhClient:
                 for item in payload:
                     if not isinstance(item, dict):
                         continue
-                    raw = str(item.get("state") or item.get("bucket") or "").lower()
-                    state = self.CHECK_STATE_ALIASES.get(raw)
-                    if state is None:
-                        continue
+                    # bucket is authoritative; state is a fallback. Unknown
+                    # values fail CLOSED (treated as not-passed) instead of
+                    # being dropped.
+                    raw_bucket = str(item.get("bucket") or "").lower()
+                    raw_state = str(item.get("state") or "").lower()
+                    state = (
+                        self.CHECK_STATE_ALIASES.get(raw_bucket)
+                        or self.CHECK_STATE_ALIASES.get(raw_state)
+                        or "UNKNOWN"
+                    )
                     checks.append({"name": str(item.get("name", "")), "state": state})
                 return checks
         # Legacy text output fallback.

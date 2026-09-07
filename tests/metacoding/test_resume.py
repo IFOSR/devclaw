@@ -116,3 +116,26 @@ def test_resume_reports_missing_current_round_for_coding(store: RunStore) -> Non
     # round 1 was never started; resume replans the round from scratch
     assert plan.action == "rerun_coder"
     assert plan.round_number == 1
+
+
+def test_resume_rejects_tampered_snapshot_without_fallback(tmp_path: Path, store: RunStore) -> None:
+    """A corrupted snapshot blocks the resume; no fallback to config.toml."""
+    from metacoding.cli import EXIT_USAGE
+    from metacoding.config import default_config
+    from metacoding.service import MetaCodingService
+
+    record = store.create_run(
+        requirement="req",
+        config=default_config(),
+        baseline=make_snapshot(),
+    )
+    # tamper: drop a required snapshot field
+    corrupted = record.config_snapshot
+    corrupted["harness"].pop("coder")
+    record.config_snapshot = corrupted
+    store.save_run(record)
+
+    service = MetaCodingService(project_root=tmp_path)
+    outcome = service.resume()
+    assert outcome.exit_code == EXIT_USAGE
+    assert "missing" in outcome.message

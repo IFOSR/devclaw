@@ -204,24 +204,40 @@ def _raise_busy(root: Path, path: Path, current: LockInfo | None, note: str = ""
 def release_lock(
     project_root: Path,
     *,
-    expected_pid: int | None = None,
-    expected_run_id: str | None = None,
+    expected_pid: int,
+    expected_run_id: str,
 ) -> bool:
-    """Unlink the lock when it still matches ``expected_*``; never touch a
-    lock owned by someone else."""
+    """Unlink the lock only when it still belongs to ``expected_*``.
+
+    CAS semantics: the file is opened, exclusively flocked, re-read, and
+    verified before unlinking, so a racing owner change can never cause the
+    wrong lock to be deleted. Both owner fields are required on purpose —
+    there is no safe unconditional release.
+    """
     path = lock_path(project_root)
-    current = _read_path(path)
-    if current is None:
-        return False
-    if expected_pid is not None and current.pid != expected_pid:
-        return False
-    if expected_run_id is not None and current.run_id != expected_run_id:
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except FileNotFoundError:
         return False
     try:
-        path.unlink()
-        return True
-    except FileNotFoundError:  # pragma: no cover - racing release
-        return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False  # someone else is mutating or owning it
+        current = _read_path(path)
+        if current is None or current.pid != expected_pid or current.run_id != expected_run_id:
+            return False
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:  # pragma: no cover - racing release
+            return False
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:  # pragma: no cover
+            pass
+        os.close(fd)
 
 
 def update_lock_run_id(project_root: Path, run_id: str) -> None:
@@ -240,6 +256,10 @@ def update_lock_run_id(project_root: Path, run_id: str) -> None:
                                  acquired_at=existing.acquired_at))
     finally:
         os.close(fd)
+
+
+# Kept for import compatibility; callers must migrate to LockHandle.release.
+_ = update_lock_run_id
 
 
 class project_lock:

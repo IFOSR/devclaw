@@ -159,6 +159,20 @@ class _FakeHarnessMixin(Harness):
                 f"fake harness wrote no structured report for stage {stage!r}"
             )
         apply_step_to_project(self.project_root, step)
+        tamper = step.get("tamper_evidence")
+        if tamper:
+            # Simulate a harness rewriting host-owned runtime evidence.
+            target = (
+                self.project_root
+                / ".metacoding"
+                / "runs"
+                / ctx.run_id
+                / "rounds"
+                / f"round-{ctx.round_number:03d}"
+                / str(tamper)
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('{"tampered": true}\n', encoding="utf-8")
         if ctx.transcript_sink is not None:
             stub = CommandResult(
                 command=["<fake>", stage],

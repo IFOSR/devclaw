@@ -328,3 +328,27 @@ def test_max_execution_seconds_configured_and_validated(tmp_path: Path) -> None:
     write_config(tmp_path, "[limits]\nmax_execution_seconds = 0\n")
     with pytest.raises(ConfigError):
         load_config(tmp_path)
+
+
+# --- snapshot strictness: missing fields are corruption -------------------------------
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda s: s["harness"].pop("coder"),
+        lambda s: s["harness"]["tester"].pop("model"),
+        lambda s: s["limits"].pop("max_execution_seconds"),
+        lambda s: s["github"].pop("enabled"),
+        lambda s: s["policy"].pop("tester_can_modify_source"),
+        lambda s: s.pop("limits"),
+    ],
+)
+def test_snapshot_missing_fields_are_rejected(mutate) -> None:
+    from metacoding.config import ProjectConfig
+
+    snapshot = json.loads(json.dumps(default_config().to_dict()))
+    mutate(snapshot)
+    with pytest.raises(ConfigError) as excinfo:
+        ProjectConfig.from_dict(snapshot)
+    assert "missing" in str(excinfo.value)

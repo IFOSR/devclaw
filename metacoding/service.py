@@ -116,13 +116,12 @@ class MetaCodingService:
 
         Models, commands, and policy must not silently change mid-run when
         the project config file is edited; explicit CLI overrides still win.
+        A corrupt or tampered snapshot blocks the resume instead of falling
+        back to the current config file.
         """
         from metacoding.config import ProjectConfig, apply_cli_overrides
 
-        try:
-            config = ProjectConfig.from_dict(record.config_snapshot)
-        except Exception:
-            config = self._config()
+        config = ProjectConfig.from_dict(record.config_snapshot)
         return apply_cli_overrides(config, self.overrides)
 
     def cancel(self) -> Outcome:

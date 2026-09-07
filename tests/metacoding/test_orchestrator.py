@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -371,7 +372,9 @@ def test_tester_contamination_blocks(tmp_path: Path) -> None:
     orchestrator, _ = make_orchestrator(tmp_path, script)
     result = orchestrator.start("add audit logging")
     assert result.status is RunStatus.BLOCKED
-    assert "contaminat" in result.final.reason.lower()
+    reason = result.final.reason.lower()
+    assert "contaminat" in reason or "permitted scope" in reason
+    assert "src/audit.py" in result.final.reason
 
 
 def test_protected_path_modification_blocks(tmp_path: Path) -> None:
@@ -502,7 +505,7 @@ def test_new_run_rejected_while_active_run_exists(tmp_path: Path) -> None:
     with pytest.raises(MetaCodingError) as excinfo:
         orchestrator.start("another requirement")
     assert "resume" in str(excinfo.value).lower()
-    release_lock(tmp_path)
+    release_lock(tmp_path, expected_pid=os.getpid(), expected_run_id=record.run_id)
     store.clear_active_run()
 
 
@@ -758,3 +761,112 @@ def test_harness_git_commit_is_blocked(tmp_path: Path) -> None:
     result = orchestrator.start("add audit logging")
     assert result.status is RunStatus.BLOCKED
     assert "git state" in result.final.reason
+
+
+# --- runtime evidence tampering and git metadata fingerprints -----------------------
+
+
+def test_tester_rewriting_round_evidence_is_blocked(tmp_path: Path) -> None:
+    tampered_test = dict(make_test_step())
+    tampered_test = {"tamper_evidence": "coding-report.json", "payload": tampered_test}
+    script = scenario(test=[tampered_test])
+    orchestrator, _ = make_orchestrator(tmp_path, script)
+    result = orchestrator.start("add audit logging")
+    assert result.status is RunStatus.BLOCKED
+    assert "runtime evidence" in result.final.reason
+    assert "coding-report.json" in result.final.reason
+
+
+def test_coder_tampering_state_json_is_blocked(tmp_path: Path) -> None:
+    script = scenario(
+        code=[code_payload(files={".metacoding/state.json": "{\"active_run_id\": \"fake\"}"})]
+    )
+    orchestrator, _ = make_orchestrator(tmp_path, script)
+    result = orchestrator.start("add audit logging")
+    assert result.status is RunStatus.BLOCKED
+    assert "runtime evidence" in result.final.reason or ".metacoding/state.json" in result.final.reason
+
+
+def test_harness_modifying_git_config_is_blocked(tmp_path: Path) -> None:
+    import subprocess as sp
+
+    sp.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
+    sp.run(["git", "-C", str(tmp_path), "config", "user.email", "t@e.st"], check=True)
+    sp.run(["git", "-C", str(tmp_path), "config", "user.name", "T"], check=True)
+    (tmp_path / "README.md").write_text("base\n", encoding="utf-8")
+    sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    sp.run(["git", "-C", str(tmp_path), "commit", "-q", "-m", "init"], check=True)
+
+    # the coder overwrites .git/config during its stage
+    step = code_payload(files={"src/audit.py": "log()\n"})
+    step = {
+        "files": {".git/config": "[core]\n\trepositoryformatversion = 0\n"},
+        "payload": step["payload"] if "payload" in step else step,
+    }
+    script = scenario(code=[step])
+    orchestrator, _ = make_orchestrator(tmp_path, script)
+    result = orchestrator.start("add audit logging")
+    assert result.status is RunStatus.BLOCKED
+    assert ".git/config" in result.final.reason or "git" in result.final.reason.lower()
+
+
+def test_harness_creating_ignored_file_is_blocked(tmp_path: Path) -> None:
+    import subprocess as sp
+
+    sp.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / ".gitignore").write_text("secrets/*\n", encoding="utf-8")
+    sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True, capture_output=True)
+    sp.run(
+        ["git", "-C", str(tmp_path), "-c", "user.email=a@b.c", "-c", "user.name=x",
+         "commit", "-q", "-m", "init"],
+        check=True, capture_output=True,
+    )
+    # the tester writes a gitignored secret file
+    step = dict(make_test_step())
+    step = {"files": {"secrets/leaked.env": "TOKEN=x\n"}, "payload": step}
+    script = scenario(test=[step])
+    orchestrator, _ = make_orchestrator(tmp_path, script)
+    result = orchestrator.start("add audit logging")
+    assert result.status is RunStatus.BLOCKED
+    assert "secrets/leaked.env" in result.final.reason or "permitted scope" in result.final.reason
+
+
+def test_final_report_commit_failure_is_recorded_in_final(tmp_path: Path) -> None:
+    from metacoding.errors import GitDeliveryError
+
+    class CommittingThenFailingDeliverer:
+        def __init__(self):
+            self.calls = 0
+
+        def deliver(self, run_id, owned_files):
+            self.calls += 1
+            if self.calls == 1:
+                return {"branch": f"metacoding/{run_id}", "commit": "sha-1",
+                        "committed_files": owned_files, "pushed": False,
+                        "checks_failed": False, "warnings": []}
+            # the FINAL_REPORT follow-up commit fails
+            raise GitDeliveryError("hook rejected the report commit")
+
+    deliverer = CommittingThenFailingDeliverer()
+    script = scenario(code=[code_payload(files={"src/audit.py": "log()\n"})])
+    orchestrator, _ = make_orchestrator(
+        tmp_path, script,
+        replace(make_config(), github=replace(default_config().github, enabled=True)),
+        deliverer=deliverer,
+    )
+    result = orchestrator.start("add audit logging")
+    assert result.status is RunStatus.DELIVERED
+    assert deliverer.calls == 2
+    assert any(
+        "final report" in warning.lower() and "could not be committed" in warning.lower()
+        for warning in result.final.warnings
+    )
+    # final.json and the delivery artifact both record the failure
+    delivery = orchestrator.store.load_git_artifact(result.run_id, "delivery")
+    assert delivery["final_report"]["committed"] is False
+    assert "error" in delivery["final_report"]
+    import json as _json
+    final_json = _json.loads(
+        (orchestrator.store.run_dir(result.run_id) / "final.json").read_text("utf-8")
+    )
+    assert any("could not be committed" in w for w in final_json["warnings"])

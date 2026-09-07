@@ -107,9 +107,14 @@ are rejected at load time), and Codex harnesses always run with the
 - **Stage write guards**: each harness may only write its payload files, the
   transcripts, and (for the coder) planner-allowed product paths. The
   planner/tester touching product files, or anyone touching
-  `.metacoding/config.toml`, run evidence, or contract documents is blocked
-  with evidence. Harnesses that commit, merge, or switch branches (changing
-  HEAD or the branch) are blocked too — git history is host-owned.
+  `.metacoding/config.toml`, contract documents, or **runtime evidence**
+  (run.json, round records, the plan, git artifacts — verified with an
+  independent hash snapshot, since git cannot see them) is blocked with
+  evidence. Git internals (`.git/config`, hooks, refs) are fingerprinted, so
+  harnesses cannot rewrite git configuration; creating or deleting gitignored
+  files (e.g. leaked secrets) is detected too, while content edits inside
+  already-ignored files remain a documented limitation. Harnesses that commit,
+  merge, or switch branches are blocked — git history is host-owned.
 - **Total time limit**: `limits.max_execution_seconds` caps each harness
   invocation on top of the idle-output timeout.
 - **Host-protected paths**: `.git/**`, `.metacoding/config.toml`,
@@ -166,13 +171,16 @@ deliver on a dedicated `metacoding/<run-id>` branch:
   (files mixing your edits with run edits are excluded and reported)
 - no force-push, no rewriting of existing commits, never the default branch
 - push / Pull Request / check waiting require explicit `[github]` opt-in
-- required checks are read via `gh pr checks --required --json` (names with
-  spaces and cancelled checks handled) and polled until settled; failed
-  checks (with `wait_for_checks = true`) send the run back to tester evidence
-  and planner review once — a second failure requires human review instead of
-  silently marking the run delivered
-- the completed `FINAL_REPORT.md` is committed to the delivery branch so the
-  PR body link always resolves
+- required checks are read via `gh pr checks --required --json` with the
+  bucket as the authoritative field; unknown states fail **closed** (count
+  as not-passed). Checks are polled until settled; failed checks (with
+  `wait_for_checks = true`) send the run back to tester evidence and planner
+  review once — a second failure requires human review instead of silently
+  marking the run delivered
+- the completed `FINAL_REPORT.md` is committed to the delivery branch before
+  the run is finalized; if that follow-up commit fails the outcome is
+  recorded in `final.json` and the delivery artifact, not lost after
+  "delivered"
 
 ## Development
 

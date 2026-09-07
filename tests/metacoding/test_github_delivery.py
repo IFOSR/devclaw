@@ -646,3 +646,28 @@ def test_gh_checks_json_with_spaced_names_and_cancel_bucket(tmp_path, monkeypatc
     from metacoding.github import SUCCESS_CHECK_STATES
 
     assert any(state not in SUCCESS_CHECK_STATES for state in by_name.values())
+
+
+def test_checks_fail_closed_on_unknown_states(tmp_path, monkeypatch) -> None:
+    from metacoding.github import SUCCESS_CHECK_STATES, GhClient
+
+    payload = json.dumps(
+        [
+            # bucket is authoritative even when state is an unknown value
+            {"name": "Unit tests", "bucket": "fail", "state": "ERROR"},
+            # neither value recognized: UNKNOWN, which fails delivery
+            {"name": "Weird", "bucket": "banana", "state": "PINEAPPLE"},
+        ]
+    )
+
+    class FakeResult:
+        returncode = 8
+        stdout = payload
+        stderr = ""
+
+    monkeypatch.setattr("metacoding.github.subprocess.run", lambda *a, **k: FakeResult())
+    checks = GhClient(tmp_path).checks("origin", "b")
+    by_name = {check["name"]: check["state"] for check in checks}
+    assert by_name["Unit tests"] == "FAILURE"
+    assert by_name["Weird"] == "UNKNOWN"
+    assert any(state not in SUCCESS_CHECK_STATES for state in by_name.values())
