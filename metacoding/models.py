@@ -613,6 +613,7 @@ class RoundRecord:
     planner_decision: PlannerDecision | None = None
     changed_files: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    host_checks: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -626,6 +627,7 @@ class RoundRecord:
             "planner_decision": self.planner_decision.to_dict() if self.planner_decision else None,
             "changed_files": list(self.changed_files),
             "notes": list(self.notes),
+            "host_checks": [dict(check) for check in self.host_checks],
         }
 
     @classmethod
@@ -647,6 +649,12 @@ class RoundRecord:
             planner_decision=validate_planner_decision(decision) if decision else None,
             changed_files=_require_str_list(data, "changed_files", "round record"),
             notes=_require_str_list(data, "notes", "round record"),
+            host_checks=[
+                dict(_require_mapping(item, "host check"))
+                for item in _require_list(data, "host_checks", "round record")
+            ]
+            if data.get("host_checks") is not None
+            else [],
         )
 
 

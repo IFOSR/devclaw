@@ -13,7 +13,6 @@ from abc import ABC
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-
 from metacoding.config import HarnessConfig
 from metacoding.errors import (
     HarnessNonZeroExit,
@@ -85,6 +84,8 @@ class HarnessContext:
     tester_report: TesterReport | None = None
     changed_files: list[str] = field(default_factory=list)
     test_commands: list[str] = field(default_factory=list)
+    host_checks: list[dict] = field(default_factory=list)
+    policy: Any = None
     transcript_sink: Callable[[str, CommandResult], None] | None = None
 
     @property

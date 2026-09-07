@@ -17,6 +17,24 @@ from metacoding.models import PlannerPlan, TesterReport
 
 BLOCKING_SEVERITIES = ("P0", "P1")
 
+#: Paths the host always protects, regardless of what a planner reports.
+HOST_PROTECTED_FILES = (
+    ".metacoding/config.toml",
+    ".metacoding/state.json",
+    ".metacoding/active-run.lock",
+)
+HOST_PROTECTED_PREFIXES = (".git/",)
+
+#: Default write scope a tester may touch during its own stage. The
+#: orchestrator narrows this to the run's own directory.
+DEFAULT_TESTER_ALLOWED_PREFIXES = (".metacoding/",)
+TESTER_ALLOWED_FILES = ("docs/metacoding/TEST_REPORT.md",)
+
+
+def is_host_protected(path: str) -> bool:
+    """True when a path is protected by the host itself, not the planner."""
+    return path in HOST_PROTECTED_FILES or path.startswith(HOST_PROTECTED_PREFIXES)
+
 
 @dataclass(frozen=True)
 class GateResult:
@@ -54,7 +72,8 @@ def scope_gate(changed_files: Iterable[str], policy) -> GateResult:
     violations = sorted(
         path
         for path in changed_files
-        if not any(path_matches(path, pattern) for pattern in policy.allowed_paths)
+        if is_host_protected(path)
+        or not any(path_matches(path, pattern) for pattern in policy.allowed_paths)
     )
     if violations:
         return GateResult(
@@ -67,7 +86,8 @@ def protected_path_gate(changed_files: Iterable[str], policy) -> GateResult:
     violations = sorted(
         path
         for path in changed_files
-        if any(path_matches(path, pattern) for pattern in policy.protected_paths)
+        if is_host_protected(path)
+        or any(path_matches(path, pattern) for pattern in policy.protected_paths)
     )
     if violations:
         return GateResult(
@@ -89,15 +109,41 @@ def severity_gate(report: TesterReport) -> GateResult:
     return GateResult("severity", True)
 
 
-def deterministic_checks_gate(report: TesterReport) -> GateResult:
-    failures = tuple(
+def deterministic_checks_gate(
+    report: TesterReport, host_checks: list[dict] | None = None
+) -> GateResult:
+    """Gate over tester-reported AND host-executed deterministic checks.
+
+    The host executes the detected project test commands itself; a tester
+    report claiming success for a command the host saw fail is rejected as
+    inconsistent evidence.
+    """
+    failures: list[str] = [
         f"{command.command} (exit {command.exit_code})"
         for command in report.test_commands
         if command.exit_code != 0
-    )
+    ]
+    host_by_command: dict[str, int] = {}
+    for check in host_checks or []:
+        command_text = str(check.get("command", ""))
+        exit_code = int(check.get("exit_code", 0))
+        host_by_command[command_text] = exit_code
+        if exit_code != 0:
+            failures.append(f"host: {command_text} (exit {exit_code})")
+    for command in report.test_commands:
+        host_exit = host_by_command.get(command.command)
+        if (
+            host_exit is not None
+            and host_exit != 0
+            and command.exit_code == 0
+        ):
+            failures.append(
+                f"tester reported success for '{command.command}' but host "
+                f"execution failed (exit {host_exit})"
+            )
     if failures:
         return GateResult(
-            "deterministic_checks", False, "required test commands failed", failures
+            "deterministic_checks", False, "required test commands failed", tuple(failures)
         )
     return GateResult("deterministic_checks", True)
 
@@ -141,6 +187,8 @@ def contamination_gate(
     post_state: Mapping[str, str] | set[str],
     *,
     tester_can_modify_source: bool,
+    allowed_prefixes: tuple[str, ...] = DEFAULT_TESTER_ALLOWED_PREFIXES,
+    allowed_files: tuple[str, ...] = TESTER_ALLOWED_FILES,
 ) -> GateResult:
     pre = dict.fromkeys(pre_state, "") if isinstance(pre_state, set) else dict(pre_state)
     post = dict.fromkeys(post_state, "") if isinstance(post_state, set) else dict(post_state)
@@ -152,8 +200,7 @@ def contamination_gate(
     violations = tuple(
         path
         for path in changed
-        if path not in TESTER_ALLOWED_FILES
-        and not path.startswith(TESTER_ALLOWED_PREFIXES)
+        if path not in allowed_files and not path.startswith(allowed_prefixes)
     )
     if violations and not tester_can_modify_source:
         return GateResult(
@@ -163,7 +210,10 @@ def contamination_gate(
 
 
 def evaluate_acceptance(
-    plan: PlannerPlan, report: TesterReport, changed_files: Iterable[str]
+    plan: PlannerPlan,
+    report: TesterReport,
+    changed_files: Iterable[str],
+    host_checks: list[dict] | None = None,
 ) -> list[GateResult]:
     """All gates that must pass before a run may be delivered."""
     changed = list(changed_files)
@@ -172,7 +222,7 @@ def evaluate_acceptance(
         evidence_gate(plan, report),
         blocking_acceptance_gate(plan, report),
         severity_gate(report),
-        deterministic_checks_gate(report),
+        deterministic_checks_gate(report, host_checks),
         scope_gate(changed, plan.change_policy),
         protected_path_gate(changed, plan.change_policy),
     ]

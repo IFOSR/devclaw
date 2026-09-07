@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 
@@ -89,3 +90,50 @@ def test_signal_death_records_negative_exit(tmp_path) -> None:
     )
     assert result.exit_code == -15
     assert result.timed_out is False
+
+
+def test_output_capture_is_capped(tmp_path) -> None:
+    result = ProcessRunner().run(
+        [sys.executable, "-c", "print('x' * 100_000)"],
+        cwd=tmp_path,
+        max_stream_bytes=2_000,
+    )
+    assert result.truncated is True
+    assert len(result.stdout) < 100_000
+    assert result.stdout.endswith("x\n") or result.stdout.endswith("x")
+    assert "dropped" in result.stdout
+
+
+def test_untruncated_output_has_no_cap_notice(tmp_path) -> None:
+    result = ProcessRunner().run(
+        [sys.executable, "-c", "print('small')"], cwd=tmp_path
+    )
+    assert result.truncated is False
+    assert "dropped" not in result.stdout
+
+
+def test_idle_timeout_kills_the_whole_process_tree(tmp_path) -> None:
+    # The child spawns a grandchild and both go silent; the idle timeout
+    # must kill the entire group, not only the direct child.
+    marker = tmp_path / "grandchild.pid"
+    result = ProcessRunner().run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', "
+                "'import time,sys; open(sys.argv[1], \"w\").write(str(__import__(\"os\").getpid())); time.sleep(120)', "
+                f"{str(marker)!r}])\n"
+                "time.sleep(120)\n"
+            ),
+        ],
+        cwd=tmp_path,
+        idle_timeout_seconds=1.0,
+    )
+    assert result.timed_out is True
+    assert marker.is_file()
+    grandchild_pid = int(marker.read_text().strip())
+    time.sleep(0.3)
+    with pytest.raises(ProcessLookupError):
+        os.kill(grandchild_pid, 0)

@@ -538,4 +538,156 @@ def test_deliverer_invoked_when_github_enabled(tmp_path: Path) -> None:
     run_id, files = deliverer.calls[0]
     assert run_id == result.run_id
     assert "src/audit.py" in files
-    assert result.final.github == {"branch": "metacoding/run-1", "pushed": False}
+    assert result.final.github["branch"] == "metacoding/run-1"
+    assert result.final.github["pushed"] is False
+
+
+# --- delivery failure, delivery resume, and lock/cancel races ------------------------
+
+
+def test_git_delivery_failure_finalizes_human_review_not_stuck(tmp_path: Path) -> None:
+    from metacoding.errors import GitDeliveryError
+
+    class FailingDeliverer:
+        def deliver(self, run_id, owned_files):
+            raise GitDeliveryError("refusing to commit files outside the owned diff")
+
+    deliverer = FailingDeliverer()
+    script = scenario(code=[code_payload(files={"src/audit.py": "log()\n"})])
+    orchestrator, _ = make_orchestrator(
+        tmp_path, script, replace(make_config(), github=replace(default_config().github, enabled=True)), deliverer=deliverer
+    )
+    result = orchestrator.start("add audit logging")
+    assert result.status is RunStatus.HUMAN_REVIEW_REQUIRED
+    assert "delivery failed" in result.final.reason.lower()
+    # the run is terminal, not dangling in github_delivery
+    state = json.loads((tmp_path / ".metacoding" / "state.json").read_text("utf-8")) \
+        if (tmp_path / ".metacoding" / "state.json").exists() else None
+    assert state is None
+
+
+def test_resume_from_github_delivery_state_completes_delivery(tmp_path: Path) -> None:
+    class InterruptingDeliverer:
+        def __init__(self):
+            self.calls = 0
+
+        def deliver(self, run_id, owned_files):
+            self.calls += 1
+            if self.calls == 1:
+                raise KeyboardInterrupt  # crash mid-delivery
+            return {"branch": f"metacoding/{run_id}", "pushed": False}
+
+    deliverer = InterruptingDeliverer()
+    script = scenario(code=[code_payload(files={"src/audit.py": "log()\n"})])
+    orchestrator, _ = make_orchestrator(
+        tmp_path, script, replace(make_config(), github=replace(default_config().github, enabled=True)), deliverer=deliverer
+    )
+    first = orchestrator.start("add audit logging")
+    assert first.status is RunStatus.INTERRUPTED
+
+    # simulate a crash that persisted github_delivery as the run state
+    record = orchestrator.store.load_run(first.run_id)
+    record.status = RunStatus.GITHUB_DELIVERY
+    orchestrator.store.save_run(record, active_status=RunStatus.GITHUB_DELIVERY)
+
+    resumed = orchestrator.resume()
+    assert resumed.status is RunStatus.DELIVERED
+    assert deliverer.calls == 2
+    assert resumed.final.github["branch"] == f"metacoding/{first.run_id}"
+
+
+def test_start_leaves_no_state_when_lock_is_held_by_live_process(tmp_path: Path) -> None:
+    import subprocess as sp
+    import sys as _sys
+
+    live = sp.Popen([_sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        write_lock_for(tmp_path, run_id="other", pid=live.pid)
+        orchestrator, _ = make_orchestrator(tmp_path, scenario())
+        with pytest.raises(MetaCodingError) as excinfo:
+            orchestrator.start("req")
+        assert "active" in str(excinfo.value).lower() or "lock" in str(excinfo.value).lower()
+        assert not (tmp_path / ".metacoding" / "state.json").exists()
+        assert not list((tmp_path / ".metacoding" / "runs").glob("*")) \
+            if (tmp_path / ".metacoding" / "runs").exists() else True
+    finally:
+        live.kill()
+        live.wait()
+
+
+def test_cancel_refuses_while_run_is_executing_elsewhere(tmp_path: Path) -> None:
+    orchestrator, _ = make_orchestrator(tmp_path, scenario())
+    from metacoding.locking import project_lock
+    from metacoding.persistence import RunStore
+    from metacoding.models import ProjectSnapshot
+
+    store = RunStore(tmp_path)
+    store.create_run(
+        "pending",
+        default_config(),
+        ProjectSnapshot(
+            captured_at="2026-09-07T00:00:00Z",
+            is_git_repo=False,
+            git_head=None,
+            dirty_files=[],
+            file_inventory=[],
+            test_commands=[],
+        ),
+    )
+    with project_lock(tmp_path, "someone-else"):
+        with pytest.raises(MetaCodingError) as excinfo:
+            orchestrator.cancel()
+        assert "cannot cancel" in str(excinfo.value)
+    # after the holder releases, cancel works
+    result = orchestrator.cancel()
+    assert result.status is RunStatus.CANCELLED
+
+
+def test_second_ci_failure_requires_human_review(tmp_path: Path) -> None:
+    class AlwaysFailingChecks:
+        def __init__(self):
+            self.calls = 0
+
+        def deliver(self, run_id, owned_files):
+            self.calls += 1
+            return {
+                "branch": f"metacoding/{run_id}",
+                "commit": "sha",
+                "committed_files": list(owned_files),
+                "pushed": True,
+                "checks": [{"name": "ci", "state": "FAILURE"}],
+                "checks_failed": True,
+                "warnings": [],
+            }
+
+    deliverer = AlwaysFailingChecks()
+    script = scenario(code=[code_payload(files={"src/audit.py": "log()\n"})])
+    orchestrator, _ = make_orchestrator(
+        tmp_path,
+        script,
+        replace(make_config(), github=replace(default_config().github, enabled=True, wait_for_checks=True)),
+        deliverer=deliverer,
+    )
+    result = orchestrator.start("add audit logging")
+    assert result.status is RunStatus.HUMAN_REVIEW_REQUIRED
+    assert deliverer.calls == 2  # initial delivery + retry after CI rework round
+    assert "checks failed again" in result.final.reason.lower()
+
+
+def write_lock_for(root, *, run_id, pid):
+    import json
+    from metacoding.locking import lock_path
+
+    path = lock_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "pid": pid,
+                "host": __import__("socket").gethostname(),
+                "acquired_at": "2026-09-07T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )

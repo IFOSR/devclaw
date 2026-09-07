@@ -149,6 +149,18 @@ def release_lock(project_root: Path) -> None:
         pass
 
 
+def update_lock_run_id(project_root: Path, run_id: str) -> None:
+    """Retarget a lock we already own to the real run id.
+
+    Used because the lock is acquired before the run id exists.
+    """
+    path = lock_path(project_root)
+    existing = read_lock(project_root)
+    if existing is None or existing.pid != os.getpid():
+        return
+    _write_lock(path, LockInfo(run_id=run_id, pid=existing.pid, host=existing.host, acquired_at=existing.acquired_at))
+
+
 class project_lock:
     """Context manager owning the lock for the duration of a run."""
 

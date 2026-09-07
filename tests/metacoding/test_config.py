@@ -218,3 +218,59 @@ def test_default_config_snapshot_round_trips(tmp_path: Path) -> None:
         )
         for key, value in snapshot["harness"].items()
     ]
+
+
+# --- harness extra_args hardening ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "token", ["-s", "--sandbox", "--danger-full-access", "--yolo", "--full-auto", "-c", "--config", "--profile"]
+)
+def test_dangerous_extra_args_rejected(tmp_path: Path, token: str) -> None:
+    write_config(tmp_path, f'[harness.planner]\nextra_args = ["{token}"]\n')
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+    assert "extra_args" in str(excinfo.value)
+
+
+def test_benign_extra_args_accepted(tmp_path: Path) -> None:
+    write_config(tmp_path, '[harness.coder]\nextra_args = ["--thinking", "high"]\n')
+    config = load_config(tmp_path)
+    assert config.harness["coder"].extra_args == ["--thinking", "high"]
+
+
+# --- snapshot-based resume configuration ----------------------------------------------
+
+
+def test_project_config_from_dict_round_trips_for_resume(tmp_path: Path) -> None:
+    from metacoding.config import ProjectConfig
+
+    write_config(
+        tmp_path,
+        """
+[harness.planner]
+model = "planner-m"
+
+[github]
+enabled = true
+check_timeout_seconds = 120
+check_poll_seconds = 5
+""",
+    )
+    config = load_config(tmp_path)
+    restored = ProjectConfig.from_dict(config.to_dict())
+    assert restored == config or restored.to_dict() == config.to_dict()
+    assert restored.harness["planner"].model == "planner-m"
+    assert restored.github.check_timeout_seconds == 120
+    # a snapshot survives a later config file change
+    (tmp_path / ".metacoding" / "config.toml").write_text(
+        '[harness.planner]\nmodel = "changed-after-start"\n', encoding="utf-8"
+    )
+    again = ProjectConfig.from_dict(config.to_dict())
+    assert again.harness["planner"].model == "planner-m"
+
+
+def test_github_check_timing_settings_validated(tmp_path: Path) -> None:
+    write_config(tmp_path, "[github]\ncheck_timeout_seconds = 0\n")
+    with pytest.raises(ConfigError):
+        load_config(tmp_path)

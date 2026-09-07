@@ -345,6 +345,14 @@ def resolve_resume(store: RunStore) -> ResumePlan:
     if status is RunStatus.PLANNING:
         return ResumePlan(action="rerun_planner", run_id=run_id, round_number=0)
 
+    if status in (RunStatus.ACCEPTED, RunStatus.GITHUB_DELIVERY):
+        return ResumePlan(
+            action="rerun_delivery",
+            run_id=run_id,
+            round_number=max(record.current_round, 1),
+            reason=f"run was accepted but delivery is unfinished (state {status.value})",
+        )
+
     coding = _load_optional_round_artifact(store, run_id, round_number, CODING_ARTIFACT)
     tester = _load_optional_round_artifact(store, run_id, round_number, TESTER_ARTIFACT)
 

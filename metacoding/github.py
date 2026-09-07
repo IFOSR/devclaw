@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from pathlib import Path
 
 from metacoding.errors import GitDeliveryError
@@ -91,6 +92,19 @@ class RealGitClient:
 class GhClient:
     """GitHub operations through the installed, authenticated ``gh`` CLI."""
 
+    #: ``gh pr checks`` exits non-zero when checks fail or are pending;
+    #: those states are data, not errors.
+    CHECK_STATE_ALIASES = {
+        "pass": "SUCCESS",
+        "success": "SUCCESS",
+        "fail": "FAILURE",
+        "failure": "FAILURE",
+        "failed": "FAILURE",
+        "pending": "PENDING",
+        "skipping": "SKIPPED",
+        "skipped": "SKIPPED",
+    }
+
     def __init__(self, project_root: Path) -> None:
         self.project_root = Path(project_root)
 
@@ -142,13 +156,52 @@ class GhClient:
             return {"url": url, "created": False}
 
     def checks(self, remote: str, branch: str) -> list[dict]:
-        output = self._run("pr", "checks", branch).stdout
+        """Required-check states for the branch's pull request.
+
+        ``gh pr checks`` exits 8 for failed checks and non-zero while
+        pending; the text output is still parsed in those cases. An exit
+        code of 1 with no check rows means the PR or checks do not exist.
+        """
+        result = self._run("pr", "checks", branch, check=False)
+        if not result.stdout.strip():
+            if result.returncode != 0:
+                raise GitDeliveryError(
+                    f"gh pr checks {branch} failed: "
+                    f"{result.stderr.strip() or result.returncode}"
+                )
+            return []
         checks: list[dict] = []
-        for line in output.splitlines():
+        for line in result.stdout.splitlines():
             parts = line.split()
-            if len(parts) >= 2 and parts[0].lower() not in ("name", "–", "-"):
-                checks.append({"name": parts[0], "state": parts[1]})
+            if len(parts) < 2:
+                continue
+            name, raw_state = parts[0], parts[1].lower()
+            if name.lower() == "name" or raw_state not in self.CHECK_STATE_ALIASES:
+                continue
+            checks.append(
+                {"name": name, "state": self.CHECK_STATE_ALIASES[raw_state]}
+            )
         return checks
+
+    def wait_for_checks(
+        self,
+        remote: str,
+        branch: str,
+        *,
+        timeout_seconds: int,
+        poll_seconds: int,
+        sleeper=None,
+    ) -> list[dict]:
+        """Poll required checks until they settle or the timeout expires."""
+        sleep = sleeper or time.sleep
+        deadline = time.monotonic() + max(timeout_seconds, 0)
+        while True:
+            checks = self.checks(remote, branch)
+            if not any(check["state"] == "PENDING" for check in checks):
+                return checks
+            if time.monotonic() >= deadline:
+                return checks
+            sleep(max(poll_seconds, 1))
 
 
 class GitDeliverer:
@@ -168,14 +221,48 @@ class GitDeliverer:
         self.gh = gh_client or GhClient(project_root)
 
     def deliver(self, run_id: str, owned_files: list[str]) -> dict:
+        github = self.config.github
+        warnings: list[str] = []
+
+        if github.mode == "none":
+            return {
+                "mode": "none",
+                "branch": None,
+                "commit": None,
+                "committed_files": [],
+                "pushed": False,
+                "pr": None,
+                "checks": None,
+                "checks_failed": False,
+                "warnings": ["github.mode is 'none'; no delivery actions taken"],
+            }
+
+        if not github.auto_commit:
+            warnings.append(
+                "auto_commit is disabled; the operator commits the owned diff manually"
+            )
+            if github.auto_push or github.auto_create_pr:
+                warnings.append(
+                    "auto_push/auto_create_pr require auto_commit; remote actions skipped"
+                )
+            return {
+                "mode": github.mode,
+                "branch": None,
+                "commit": None,
+                "committed_files": [],
+                "pushed": False,
+                "pr": None,
+                "checks": None,
+                "checks_failed": False,
+                "warnings": warnings,
+            }
+
         if not self.git.is_repo():
             raise GitDeliveryError(
                 f"{self.project_root} is not a git repository; "
                 "delivery requires git (disable [github] for docs-only delivery)"
             )
-        github = self.config.github
         branch = f"{github.branch_prefix}{run_id}"
-        warnings: list[str] = []
         created_new_branch = False
 
         if self.git.branch_exists(branch):
@@ -223,7 +310,8 @@ class GitDeliverer:
                 summary["pushed"] = False
                 warnings.append(f"push failed: {exc}")
 
-        if github.auto_create_pr:
+        wants_pr = github.auto_create_pr and github.mode == "pull-request"
+        if wants_pr:
             try:
                 summary["pr"] = self.gh.ensure_pr(
                     github.remote,
@@ -236,7 +324,12 @@ class GitDeliverer:
 
         if github.wait_for_checks and summary["pushed"]:
             try:
-                checks = self.gh.checks(github.remote, branch)
+                checks = self.gh.wait_for_checks(
+                    github.remote,
+                    branch,
+                    timeout_seconds=github.check_timeout_seconds,
+                    poll_seconds=github.check_poll_seconds,
+                )
                 summary["checks"] = checks
                 failed = [
                     check

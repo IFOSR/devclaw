@@ -24,6 +24,9 @@ class CodexPlanner(Harness):
         if self.config.model:
             command += ["-m", self.config.model]
         command += [
+            # The host pins the sandbox level; extra_args cannot override it.
+            "-s",
+            "workspace-write",
             "--skip-git-repo-check",
             "--json",
             "-o",
@@ -83,6 +86,11 @@ Write only files you own plus the JSON payload path above."""
                 f"PRD drift: {report.prd_drift}\n"
                 f"regression risks: {report.regression_risks}"
             )
+        host_lines = ctx.host_checks or []
+        host_summary = "\n".join(
+            f"- {check.get('command')} -> exit {check.get('exit_code')}"
+            for check in host_lines
+        ) or "- (host executed no test commands)"
         return f"""You are the PLANNER harness of MetaCoding reviewing round {ctx.round_number}.
 
 Requirement:
@@ -93,9 +101,13 @@ Read these artifacts from the workspace before deciding:
 - The Tester report for this round: {ctx.report_dir / 'tester-report.json'}
 - The human-readable test report: {ctx.docs_dir / 'TEST_REPORT.md'}
 - The Coder report for this round: {ctx.report_dir / 'coding-report.json'}
+- Host-executed deterministic checks: {ctx.report_dir / 'host-checks.json'}
 
 Tester evidence summary:
 {tester_summary}
+
+Host-executed check results (ground truth from the MetaCoding host):
+{host_summary}
 
 Changed files this round: {ctx.changed_files}
 

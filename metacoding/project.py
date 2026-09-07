@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import sys
 from typing import Mapping
 from pathlib import Path
 
@@ -49,10 +50,14 @@ def git_head(root: Path) -> str | None:
 
 
 def current_dirty_files(root: Path) -> set[str]:
-    """All modified, staged, added, renamed, and untracked paths."""
+    """All modified, staged, added, renamed, and untracked paths.
+
+    ``-uall`` expands untracked directories into individual files so the
+    workspace state is content-comparable file by file.
+    """
     if not _is_git_repo(root):
         return set()
-    code, output = _git(root, "status", "--porcelain")
+    code, output = _git(root, "status", "--porcelain", "-uall")
     if code != 0:
         return set()
     dirty: set[str] = set()
@@ -104,12 +109,13 @@ def detect_test_commands(root: Path) -> list[str]:
     """Best-effort detection of the project's own test entry points."""
     commands: list[str] = []
     root = Path(root)
+    pytest_command = f"{sys.executable} -m pytest -q"
     has_pytest_config = (root / "pytest.ini").is_file() or (root / "pyproject.toml").is_file()
     has_test_files = bool(list(root.glob("test_*.py"))) or bool(
         list(root.glob("tests/test_*.py"))
     )
     if has_pytest_config or has_test_files:
-        commands.append("python3 -m pytest -q")
+        commands.append(pytest_command)
 
     package_json = root / "package.json"
     if package_json.is_file():
@@ -129,16 +135,28 @@ def detect_test_commands(root: Path) -> list[str]:
 
 
 def workspace_state(project_root: Path) -> dict[str, str]:
-    """Ground-truth workspace state: dirty-file set for git projects,
-    content hashes for plain directories."""
+    """Ground-truth workspace state as ``path -> content hash``.
+
+    For git repositories only the dirty files are hashed (a file that was
+    already dirty at baseline keeps a comparable hash so later edits are
+    detectable). For plain directories the whole inventory is hashed.
+    Deleted paths are recorded as ``<deleted>``.
+    """
     root = Path(project_root)
     if _is_git_repo(root):
-        return {path: "dirty" for path in current_dirty_files(root)}
-    state: dict[str, str] = {}
-    for relative in _inventory(root):
-        data = (root / relative).read_bytes()
-        state[relative] = hashlib.sha256(data).hexdigest()
-    return state
+        state: dict[str, str] = {}
+        for path in current_dirty_files(root):
+            state[path] = _file_hash(root / path)
+        return state
+    return {path: _file_hash(root / path) for path in _inventory(root)}
+
+
+def _file_hash(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+    except (FileNotFoundError, IsADirectoryError, PermissionError):
+        return "<deleted>"
+    return hashlib.sha256(data).hexdigest()
 
 
 def detect_workspace_changes(

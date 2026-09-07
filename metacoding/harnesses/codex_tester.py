@@ -19,6 +19,9 @@ class CodexTester(Harness):
         if self.config.model:
             command += ["-m", self.config.model]
         command += [
+            # The host pins the sandbox level; extra_args cannot override it.
+            "-s",
+            "workspace-write",
             "--skip-git-repo-check",
             "--json",
             "-o",

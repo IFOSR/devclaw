@@ -39,9 +39,11 @@ tester_can_modify_source = false
 [github]
 enabled = false
 remote = "origin"
-mode = "pull-request"
+mode = "pull-request"          # pull-request | branch | none
 branch_prefix = "metacoding/"
 auto_commit = true
 auto_push = false
 auto_create_pr = false
 wait_for_checks = true
+check_timeout_seconds = 600    # polling window for required checks
+check_poll_seconds = 15

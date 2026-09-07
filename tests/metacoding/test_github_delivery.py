@@ -239,6 +239,18 @@ class FakeGhClient:
         self.calls.append(("checks", remote, branch))
         return list(self.checks_payload)
 
+    def wait_for_checks(
+        self,
+        remote: str,
+        branch: str,
+        *,
+        timeout_seconds: int,
+        poll_seconds: int,
+        sleeper=None,
+    ) -> list[dict]:
+        # The fake settles immediately: no PENDING states are returned.
+        return self.checks(remote, branch)
+
 
 def remote_deliverer(
     tmp_path: Path, git_client: FakeGitClient, gh_client: FakeGhClient, **github_overrides
@@ -416,14 +428,17 @@ def _ci_orchestrator(tmp_path: Path, deliverer):
             ],
             "code": [
                 {
-                    "status": "completed",
-                    "summary": "done",
-                    "completed_tasks": [],
-                    "changed_files": ["src/a.py"],
-                    "tests_added_or_changed": [],
-                    "commands_run": [],
-                    "known_limitations": [],
-                    "blocked_reason": None,
+                    "files": {"src/a.py": "a\n"},
+                    "payload": {
+                        "status": "completed",
+                        "summary": "done",
+                        "completed_tasks": [],
+                        "changed_files": ["src/a.py"],
+                        "tests_added_or_changed": [],
+                        "commands_run": [],
+                        "known_limitations": [],
+                        "blocked_reason": None,
+                    },
                 }
             ],
             "test": test_steps,
@@ -497,3 +512,97 @@ def test_checks_ignored_without_wait_for_checks(tmp_path: Path) -> None:
     result = orchestrator.start("add audit logging")
     assert result.status.value == "delivered"
     assert deliverer.calls == 1
+
+
+# --- check parsing, polling, and delivery modes --------------------------------------
+
+
+def test_gh_checks_parse_failure_and_pending_states(tmp_path: Path, monkeypatch) -> None:
+    from metacoding.github import GhClient
+
+    client = GhClient(tmp_path)
+    payload = (
+        "ci  fail  1m  https://example.com/ci\n"
+        "lint pending 2s https://example.com/lint\n"
+        "name state elapsed details\n"
+    )
+
+    class FakeResult:
+        returncode = 8  # gh exits non-zero when checks fail or are pending
+        stdout = payload
+        stderr = ""
+
+    monkeypatch.setattr(
+        "metacoding.github.subprocess.run", lambda *a, **k: FakeResult()
+    )
+    checks = client.checks("origin", "metacoding/run-1")
+    assert {"name": "ci", "state": "FAILURE"} in checks
+    assert {"name": "lint", "state": "PENDING"} in checks
+    assert len(checks) == 2  # header line ignored
+
+
+def test_wait_for_checks_polls_until_settled(tmp_path: Path) -> None:
+    from metacoding.github import GhClient
+
+    client = GhClient(tmp_path)
+    waves = iter(
+        [
+            [{"name": "ci", "state": "PENDING"}],
+            [{"name": "ci", "state": "PENDING"}],
+            [{"name": "ci", "state": "SUCCESS"}],
+        ]
+    )
+    sleeps: list[int] = []
+    client.checks = lambda remote, branch: next(waves)
+    final = client.wait_for_checks(
+        "origin", "b", timeout_seconds=60, poll_seconds=1, sleeper=sleeps.append
+    )
+    assert final == [{"name": "ci", "state": "SUCCESS"}]
+    assert sleeps == [1, 1]
+
+
+def test_wait_for_checks_times_out_with_pending(tmp_path: Path) -> None:
+    from metacoding.github import GhClient
+
+    client = GhClient(tmp_path)
+    client.checks = lambda remote, branch: [{"name": "ci", "state": "PENDING"}]
+    final = client.wait_for_checks(
+        "origin", "b", timeout_seconds=0, poll_seconds=1, sleeper=lambda s: None
+    )
+    assert final == [{"name": "ci", "state": "PENDING"}]
+
+
+def test_mode_none_skips_all_delivery_actions(tmp_path: Path) -> None:
+    git_client = FakeGitClient(tmp_path)
+    gh_client = FakeGhClient()
+    deliv = remote_deliverer(
+        tmp_path, git_client, gh_client, auto_push=True, auto_create_pr=True, mode="none"
+    )
+    summary = deliv.deliver("run-1", ["src/a.py"])
+    assert summary["mode"] == "none"
+    assert summary["branch"] is None
+    assert git_client.pushes == [] and gh_client.calls == []
+
+
+def test_auto_commit_false_skips_branch_commit_and_remote(tmp_path: Path) -> None:
+    git_client = FakeGitClient(tmp_path)
+    gh_client = FakeGhClient()
+    deliv = remote_deliverer(
+        tmp_path, git_client, gh_client, auto_push=True, auto_create_pr=True, auto_commit=False
+    )
+    summary = deliv.deliver("run-1", ["src/a.py"])
+    assert summary["branch"] is None and summary["commit"] is None
+    assert git_client.pushes == [] and gh_client.calls == []
+    assert any("auto_commit" in warning for warning in summary["warnings"])
+
+
+def test_mode_branch_never_creates_pr(tmp_path: Path) -> None:
+    git_client = FakeGitClient(tmp_path)
+    gh_client = FakeGhClient()
+    deliv = remote_deliverer(
+        tmp_path, git_client, gh_client, auto_push=True, auto_create_pr=True, mode="branch"
+    )
+    summary = deliv.deliver("run-1", ["src/a.py"])
+    assert git_client.pushes == [("origin", "metacoding/run-1", False)]
+    assert all(call[0] != "ensure_pr" for call in gh_client.calls)
+    assert summary["pr"] is None

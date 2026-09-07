@@ -92,7 +92,17 @@ class MetaCodingService:
 
     def resume(self, emit: EVENT | None = None) -> Outcome:
         try:
-            config = self._config()
+            from metacoding.persistence import resolve_resume
+
+            plan = resolve_resume(self.store)
+            if plan.action == "nothing_to_resume":
+                raise MetaCodingError("no active run to resume")
+            if plan.action == "cannot_resume_terminal":
+                raise MetaCodingError(
+                    f"run {plan.run_id} already finished and cannot be resumed"
+                )
+            record = self.store.load_run(plan.run_id)
+            config = self._resume_config(record)
             orchestrator = self._orchestrator(
                 config, emit=emit if emit is not None else default_emitter()
             )
@@ -100,6 +110,20 @@ class MetaCodingService:
         except MetaCodingError as exc:
             return Outcome("error", EXIT_USAGE, str(exc))
         return self._outcome(result)
+
+    def _resume_config(self, record):
+        """Resume with the run's persisted configuration snapshot.
+
+        Models, commands, and policy must not silently change mid-run when
+        the project config file is edited; explicit CLI overrides still win.
+        """
+        from metacoding.config import ProjectConfig, apply_cli_overrides
+
+        try:
+            config = ProjectConfig.from_dict(record.config_snapshot)
+        except Exception:
+            config = self._config()
+        return apply_cli_overrides(config, self.overrides)
 
     def cancel(self) -> Outcome:
         try:

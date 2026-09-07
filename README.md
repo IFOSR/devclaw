@@ -90,7 +90,27 @@ Overrides apply to the current invocation only and are never written back:
 ```
 
 Secrets are rejected in `config.toml`; harnesses inherit authentication from
-the current process environment.
+the current process environment. Harness `extra_args` cannot override the
+host-controlled sandbox level or CLI configuration (`-s/--sandbox/-c/--config/--profile/--yolo/...`
+are rejected at load time), and Codex harnesses always run with the
+`workspace-write` sandbox.
+
+## Trust and safety model
+
+- **Host-executed checks**: after every tester round the host itself runs the
+  project's detected test commands and records them in `host-checks.json`.
+  The deterministic gate fails on host failures and on tester reports that
+  contradict them — a harness claiming success cannot pass the gate.
+- **Host-protected paths**: `.git/**`, `.metacoding/config.toml`,
+  `.metacoding/state.json`, and `.metacoding/active-run.lock` are protected
+  by the host itself, even when a planner allows `**`.
+- **Tester write scope**: during its stage the tester may only write inside
+  `.metacoding/runs/<run-id>/` and `docs/metacoding/TEST_REPORT.md`.
+- **Owned diff delivery**: the delivery staging set is computed from a
+  content-hash baseline captured at run start. Files that were already dirty
+  before the run ("mixed" files), files outside the allowed scope, and files
+  whose contract-document content no longer matches what the host rendered
+  are never staged automatically — they are recorded as warnings instead.
 
 ## File layout
 
@@ -131,10 +151,13 @@ After local acceptance and all deterministic gates pass, MetaCoding can
 deliver on a dedicated `metacoding/<run-id>` branch:
 
 - only the run's owned files are staged — never your pre-existing dirty files
+  (files mixing your edits with run edits are excluded and reported)
 - no force-push, no rewriting of existing commits, never the default branch
 - push / Pull Request / check waiting require explicit `[github]` opt-in
-- failed required checks (with `wait_for_checks = true`) send the run back to
-  tester evidence and planner review once before a warning is recorded
+- required checks are polled until settled; failed checks (with
+  `wait_for_checks = true`) send the run back to tester evidence and planner
+  review once — a second failure requires human review instead of silently
+  marking the run delivered
 
 ## Development
 

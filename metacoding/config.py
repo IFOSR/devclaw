@@ -27,6 +27,20 @@ VALID_GITHUB_MODES = ("pull-request", "branch", "none")
 #: Keys that must never appear in the project config.
 SECRET_FIELD_NAMES = {"token", "api_key", "apikey", "secret", "password", "client_secret"}
 
+#: Harness extra_args tokens the host rejects: sandbox level, config
+#: overrides, and automation flags must stay under host control.
+FORBIDDEN_EXTRA_ARGS = {
+    "-s",
+    "--sandbox",
+    "--danger-full-access",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--yolo",
+    "--full-auto",
+    "-c",
+    "--config",
+    "--profile",
+}
+
 
 @dataclass(frozen=True)
 class HarnessConfig:
@@ -85,6 +99,8 @@ class GithubConfig:
     auto_push: bool
     auto_create_pr: bool
     wait_for_checks: bool
+    check_timeout_seconds: int = 600
+    check_poll_seconds: int = 15
 
     def to_dict(self) -> dict:
         return {
@@ -96,6 +112,8 @@ class GithubConfig:
             "auto_push": self.auto_push,
             "auto_create_pr": self.auto_create_pr,
             "wait_for_checks": self.wait_for_checks,
+            "check_timeout_seconds": self.check_timeout_seconds,
+            "check_poll_seconds": self.check_poll_seconds,
         }
 
 
@@ -118,6 +136,70 @@ class ProjectConfig:
             "policy": self.policy.to_dict(),
             "github": self.github.to_dict(),
         }
+
+    @classmethod
+    def from_dict(cls, snapshot: dict) -> "ProjectConfig":
+        """Rebuild a config from a persisted run snapshot (used on resume)."""
+        base = default_config()
+        harness_raw = snapshot.get("harness", {})
+        harness = {
+            name: HarnessConfig(
+                name=name,
+                provider=str(section.get("provider", base.harness[name].provider)),
+                command=str(section.get("command", base.harness[name].command)),
+                model=str(section.get("model", base.harness[name].model)),
+                extra_args=[str(arg) for arg in section.get("extra_args", [])],
+            )
+            for name, section in harness_raw.items()
+            if name in base.harness
+        }
+        limits_raw = snapshot.get("limits", {})
+        policy_raw = snapshot.get("policy", {})
+        github_raw = snapshot.get("github", {})
+        return cls(
+            schema_version=int(snapshot.get("schema_version", SCHEMA_VERSION)),
+            limits=LimitsConfig(
+                max_rounds=int(limits_raw.get("max_rounds", base.limits.max_rounds)),
+                same_failure_limit=int(
+                    limits_raw.get("same_failure_limit", base.limits.same_failure_limit)
+                ),
+                idle_timeout_seconds=int(
+                    limits_raw.get("idle_timeout_seconds", base.limits.idle_timeout_seconds)
+                ),
+            ),
+            harness=harness or base.harness,
+            policy=PolicyConfig(
+                allow_network=bool(policy_raw.get("allow_network", base.policy.allow_network)),
+                allow_destructive_commands=bool(
+                    policy_raw.get(
+                        "allow_destructive_commands", base.policy.allow_destructive_commands
+                    )
+                ),
+                tester_can_modify_source=bool(
+                    policy_raw.get(
+                        "tester_can_modify_source", base.policy.tester_can_modify_source
+                    )
+                ),
+            ),
+            github=GithubConfig(
+                enabled=bool(github_raw.get("enabled", base.github.enabled)),
+                remote=str(github_raw.get("remote", base.github.remote)),
+                mode=str(github_raw.get("mode", base.github.mode)),
+                branch_prefix=str(github_raw.get("branch_prefix", base.github.branch_prefix)),
+                auto_commit=bool(github_raw.get("auto_commit", base.github.auto_commit)),
+                auto_push=bool(github_raw.get("auto_push", base.github.auto_push)),
+                auto_create_pr=bool(github_raw.get("auto_create_pr", base.github.auto_create_pr)),
+                wait_for_checks=bool(
+                    github_raw.get("wait_for_checks", base.github.wait_for_checks)
+                ),
+                check_timeout_seconds=int(
+                    github_raw.get("check_timeout_seconds", base.github.check_timeout_seconds)
+                ),
+                check_poll_seconds=int(
+                    github_raw.get("check_poll_seconds", base.github.check_poll_seconds)
+                ),
+            ),
+        )
 
 
 def default_config() -> ProjectConfig:
@@ -222,6 +304,12 @@ def _merge_harness(base: dict[str, HarnessConfig], data: Any) -> dict[str, Harne
             not isinstance(arg, str) for arg in extra_args
         ):
             raise ConfigError(f"[harness.{name}] extra_args must be a list of strings")
+        rejected = sorted(set(extra_args) & FORBIDDEN_EXTRA_ARGS)
+        if rejected:
+            raise ConfigError(
+                f"[harness.{name}] extra_args contains host-controlled option(s) "
+                f"{rejected}; sandbox and config overrides are set by MetaCoding"
+            )
         merged[name] = HarnessConfig(
             name=name,
             provider=provider,
@@ -290,6 +378,13 @@ def _merge_github(base: GithubConfig, data: Any) -> GithubConfig:
     mode = string("mode", base.mode)
     if mode not in VALID_GITHUB_MODES:
         raise ConfigError(f"[github] mode must be one of {VALID_GITHUB_MODES}, got {mode!r}")
+
+    def bounded_int(key: str, current: int, minimum: int) -> int:
+        value = raw.get(key, current)
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            raise ConfigError(f"[github] {key} must be an integer >= {minimum}")
+        return value
+
     return GithubConfig(
         enabled=boolean("enabled", base.enabled),
         remote=string("remote", base.remote),
@@ -299,6 +394,10 @@ def _merge_github(base: GithubConfig, data: Any) -> GithubConfig:
         auto_push=boolean("auto_push", base.auto_push),
         auto_create_pr=boolean("auto_create_pr", base.auto_create_pr),
         wait_for_checks=boolean("wait_for_checks", base.wait_for_checks),
+        check_timeout_seconds=bounded_int(
+            "check_timeout_seconds", base.check_timeout_seconds, 1
+        ),
+        check_poll_seconds=bounded_int("check_poll_seconds", base.check_poll_seconds, 1),
     )
 
 
@@ -328,6 +427,13 @@ def _apply_overrides(config: ProjectConfig, overrides: CliOverrides) -> ProjectC
             raise ConfigError("--max-rounds must be an integer >= 1")
         limits = replace(limits, max_rounds=overrides.max_rounds)
     return replace(config, harness=harness, limits=limits)
+
+
+def apply_cli_overrides(config: ProjectConfig, overrides: CliOverrides) -> ProjectConfig:
+    """Apply command-line overrides to an already-loaded configuration."""
+    if overrides is None:
+        return config
+    return _apply_overrides(config, overrides)
 
 
 def load_config(

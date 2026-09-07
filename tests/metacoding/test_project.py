@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 from metacoding.models import ProjectSnapshot
@@ -77,11 +78,12 @@ def test_snapshot_excludes_metacoding_runtime_records(tmp_path: Path) -> None:
 def test_detect_test_commands_by_project_type(tmp_path: Path) -> None:
     assert detect_test_commands(tmp_path) == []
 
+    pytest_command = f"{sys.executable} -m pytest -q"
     pytest_dir = tmp_path / "pytest-project"
     tests_dir = pytest_dir / "tests"
     tests_dir.mkdir(parents=True)
     (tests_dir / "test_app.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
-    assert detect_test_commands(pytest_dir) == ["python3 -m pytest -q"]
+    assert detect_test_commands(pytest_dir) == [pytest_command]
 
     npm_dir = tmp_path / "npm-project"
     npm_dir.mkdir()

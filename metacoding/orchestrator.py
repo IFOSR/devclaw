@@ -11,9 +11,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+import hashlib
+import os
+import shlex
 
 from metacoding.config import ProjectConfig
 from metacoding.errors import (
+    GitDeliveryError,
     HarnessCommandMissing,
     HarnessNonZeroExit,
     HarnessTimeout,
@@ -22,7 +26,7 @@ from metacoding.errors import (
     ProtocolError,
 )
 from metacoding.harnesses.base import Harness, HarnessContext
-from metacoding.locking import project_lock
+from metacoding.locking import acquire_lock, project_lock, release_lock, update_lock_run_id
 from metacoding.models import (
     FinalReport,
     PlannerPlan,
@@ -36,11 +40,14 @@ from metacoding.policies import (
     contamination_gate,
     evaluate_acceptance,
     failure_fingerprint,
+    is_host_protected,
+    path_matches,
     protected_path_gate,
     repeated_failure_reached,
     scope_gate,
 )
-from metacoding.persistence import RunStore, ResumePlan, resolve_resume
+from metacoding.persistence import RunStore, ResumePlan, atomic_write_json, resolve_resume
+from metacoding.process_runner import ProcessRunner
 from metacoding.project import capture_snapshot, workspace_state, detect_workspace_changes
 
 EXIT_BY_STATUS = {
@@ -113,20 +120,31 @@ class Orchestrator:
                 "use `metacoding resume` to continue it or `metacoding cancel` "
                 "to abandon it before starting a new run"
             )
-        baseline = capture_snapshot(self.project_root)
-        record = self.store.create_run(requirement, self.config, baseline)
-        self.store.save_git_artifact(
-            record.run_id,
-            "baseline",
-            {
-                "git_head": baseline.git_head,
-                "is_git_repo": baseline.is_git_repo,
-                "dirty_files": baseline.dirty_files,
-                "captured_at": baseline.captured_at,
-            },
-        )
-        with project_lock(self.project_root, record.run_id):
+        # Acquire the lock BEFORE creating any run record so a lock failure
+        # never leaves an orphaned active-run pointer behind.
+        acquire_lock(self.project_root, f"pending-{os.getpid()}")
+        try:
+            baseline = capture_snapshot(self.project_root)
+            record = self.store.create_run(requirement, self.config, baseline)
+            update_lock_run_id(self.project_root, record.run_id)
+            self.store.save_git_artifact(
+                record.run_id,
+                "baseline",
+                {
+                    "git_head": baseline.git_head,
+                    "is_git_repo": baseline.is_git_repo,
+                    "dirty_files": baseline.dirty_files,
+                    "captured_at": baseline.captured_at,
+                    "workspace_state": workspace_state(self.project_root),
+                },
+            )
+        except BaseException:
+            release_lock(self.project_root)
+            raise
+        try:
             return self._execute(record)
+        finally:
+            release_lock(self.project_root)
 
     def resume(self) -> OrchestratorResult:
         plan = resolve_resume(self.store)
@@ -144,12 +162,23 @@ class Orchestrator:
         if not state or not state.get("active_run_id"):
             raise MetaCodingError("no active run to cancel")
         record = self.store.load_run(str(state["active_run_id"]))
-        return self._finalize(
-            record,
-            RunStatus.CANCELLED,
-            "cancelled by operator",
-            "The run was cancelled; all evidence is preserved.",
-        )
+        # A live lock holder means the run is executing somewhere else:
+        # refuse to clean up state underneath a running harness.
+        try:
+            acquire_lock(self.project_root, record.run_id)
+        except MetaCodingError as exc:
+            raise MetaCodingError(
+                f"cannot cancel: {exc} Stop that process first, then cancel."
+            ) from exc
+        try:
+            return self._finalize(
+                record,
+                RunStatus.CANCELLED,
+                "cancelled by operator",
+                "The run was cancelled; all evidence is preserved.",
+            )
+        finally:
+            release_lock(self.project_root)
 
     # --- main loop ---------------------------------------------------------------
 
@@ -177,6 +206,16 @@ class Orchestrator:
                 str(exc),
                 "The harness infrastructure failed before the product could be judged.",
             )
+        except GitDeliveryError as exc:
+            # Delivery is host-owned; a git safety failure needs an operator.
+            # Never leave the run dangling in the github_delivery state.
+            return self._finalize(
+                record,
+                RunStatus.HUMAN_REVIEW_REQUIRED,
+                f"git delivery failed: {exc}",
+                "The implementation was accepted locally but delivery failed; "
+                "resolve the git issue and start a new run or deliver manually.",
+            )
 
     def _execute_inner(self, record: RunRecord) -> OrchestratorResult:
         plan = self._ensure_plan(record)
@@ -185,6 +224,12 @@ class Orchestrator:
             if record.status is RunStatus.INTERRUPTED:
                 record.status = self._stage_after_interruption(record)
                 self.store.save_run(record, active_status=record.status)
+
+            if record.status in (RunStatus.ACCEPTED, RunStatus.GITHUB_DELIVERY):
+                outcome = self._run_delivery_stage(record, plan)
+                if outcome.stop is not None:
+                    return outcome.stop
+                continue
 
             if record.status is RunStatus.CODING:
                 outcome = self._run_coding_stage(record, plan)
@@ -212,6 +257,8 @@ class Orchestrator:
 
     def _stage_after_interruption(self, record: RunRecord) -> RunStatus:
         """Re-derive the pending stage from persisted round artifacts."""
+        if record.status in (RunStatus.ACCEPTED, RunStatus.GITHUB_DELIVERY):
+            return RunStatus.GITHUB_DELIVERY
         if record.current_round <= 0:
             return RunStatus.PLANNING
         round_record = self.store.load_rounds(record.run_id).get(record.current_round)
@@ -241,7 +288,7 @@ class Orchestrator:
             report_dir=report_dir,
         )
         self.store.save_plan(record.run_id, plan)
-        self._render_contract_docs(record.requirement, plan)
+        self._render_contract_docs(record.run_id, record.requirement, plan)
         record.status = RunStatus.CODING
         record.current_round = 0
         self.store.save_run(record, active_status=RunStatus.CODING)
@@ -368,12 +415,14 @@ class Orchestrator:
         post_state = workspace_state(self.project_root)
         round_record.tester_report = report
         self.store.save_round(record.run_id, round_record)
-        self._render_test_report(report, round_number)
+        self._render_test_report(record.run_id, report, round_number)
 
         contamination = contamination_gate(
             pre_state,
             post_state,
             tester_can_modify_source=self.config.policy.tester_can_modify_source,
+            # The tester may only write its own run directory and report.
+            allowed_prefixes=(f".metacoding/runs/{record.run_id}/",),
         )
         if not contamination.passed:
             stop = self._finalize(
@@ -385,11 +434,60 @@ class Orchestrator:
             )
             return _RoundOutcome(round_record, stop)
 
+        # The host executes the detected project test commands itself:
+        # deterministic gates must not trust tester self-reported results.
+        round_record.host_checks = self._run_host_checks(record, round_number)
+        self.store.save_round(record.run_id, round_record)
+        atomic_write_json(
+            self.store.round_dir(record.run_id, round_number) / "host-checks.json",
+            {"round": round_number, "checks": round_record.host_checks},
+        )
+
         fingerprint = failure_fingerprint(report)
         if fingerprint:
             record.failure_history.append(fingerprint)
             self.store.save_run(record, active_status=RunStatus.PLANNER_REVIEW)
         return _RoundOutcome(round_record)
+
+    def _run_host_checks(self, record: RunRecord, round_number: int) -> list[dict]:
+        """Execute the project's detected test commands host-side."""
+        results: list[dict] = []
+        runner = ProcessRunner()
+        for command_text in record.baseline.test_commands:
+            command = shlex.split(command_text)
+            try:
+                result = runner.run(
+                    command,
+                    cwd=self.project_root,
+                    idle_timeout_seconds=self.config.limits.idle_timeout_seconds,
+                )
+            except HarnessCommandMissing as exc:
+                results.append(
+                    {"command": command_text, "exit_code": 127, "error": str(exc)}
+                )
+                continue
+            self.store.save_transcript(
+                record.run_id,
+                harness=f"host-checks-round-{round_number:03d}",
+                attempt=len(results) + 1,
+                metadata=result.metadata(),
+                stdout=result.stdout,
+                stderr=result.stderr,
+            )
+            results.append(
+                {
+                    "command": command_text,
+                    "exit_code": result.exit_code,
+                    "timed_out": result.timed_out,
+                }
+            )
+        if results:
+            failed = [item for item in results if item["exit_code"] != 0]
+            self._info(
+                f"host checks: {len(results) - len(failed)} passed, "
+                f"{len(failed)} failed"
+            )
+        return results
 
     def _run_review_stage(self, record: RunRecord, plan: PlannerPlan) -> _RoundOutcome:
         round_number = record.current_round
@@ -408,6 +506,7 @@ class Orchestrator:
                 "plan": plan,
                 "tester_report": round_record.tester_report,
                 "changed_files": round_record.changed_files,
+                "host_checks": round_record.host_checks,
             },
         )
         round_record.planner_decision = decision
@@ -447,7 +546,10 @@ class Orchestrator:
 
         if decision.decision == "accept":
             gates = evaluate_acceptance(
-                plan, round_record.tester_report, round_record.changed_files
+                plan,
+                round_record.tester_report,
+                round_record.changed_files,
+                host_checks=round_record.host_checks,
             )
             failed = [gate for gate in gates if not gate.passed]
             if not failed:
@@ -496,48 +598,149 @@ class Orchestrator:
 
     # --- delivery -----------------------------------------------------------------
 
+    def _run_delivery_stage(self, record: RunRecord, plan: PlannerPlan) -> _RoundOutcome:
+        """Resume path: delivery was interrupted after local acceptance."""
+        round_number = max(record.current_round, 1)
+        round_record = self.store.load_rounds(record.run_id).get(round_number)
+        if round_record is None or round_record.tester_report is None:
+            raise MetaCodingError(
+                f"run {record.run_id} is in state {record.status.value} but round "
+                f"{round_number} has no accepted evidence; cancel and restart"
+            )
+        gates = evaluate_acceptance(
+            plan,
+            round_record.tester_report,
+            round_record.changed_files,
+            host_checks=round_record.host_checks,
+        )
+        failed = [gate for gate in gates if not gate.passed]
+        if failed:
+            record.status = RunStatus.CODING
+            self.store.save_run(record, active_status=RunStatus.CODING)
+            return _RoundOutcome(round_record)
+        reason = (
+            round_record.planner_decision.reason
+            if round_record.planner_decision is not None
+            else "resumed delivery"
+        )
+        delivered = self._deliver(record, plan, round_record, reason)
+        if isinstance(delivered, OrchestratorResult):
+            return _RoundOutcome(round_record, delivered)
+        return delivered
+
+    def _owned_delivery_files(self, record: RunRecord, plan: PlannerPlan) -> tuple[list[str], list[str]]:
+        """Compute the run's deliverable files against the persisted baseline.
+
+        Returns ``(deliverable, warnings)``. Files that were already dirty
+        before the run and were edited again cannot be separated from the
+        user's own edits, so they are never staged automatically. Files
+        outside the planner's allowed scope are excluded as well. Planner-
+        protected contract documents are only deliverable when their content
+        still matches what the host rendered (no harness tampering).
+        """
+        baseline_artifact = self.store.load_git_artifact(record.run_id, "baseline") or {}
+        baseline_state = baseline_artifact.get("workspace_state") or {}
+        current_state = workspace_state(self.project_root)
+        changed = detect_workspace_changes(baseline_state, current_state)
+        contract_hashes = (
+            self.store.load_git_artifact(record.run_id, "contract-hashes") or {}
+        )
+        baseline_dirty = set(record.baseline.dirty_files)
+        mixed = sorted(path for path in changed if path in baseline_dirty)
+
+        def deliverable(path: str) -> bool:
+            if is_host_protected(path):
+                return False
+            if any(path_matches(path, pattern) for pattern in plan.change_policy.allowed_paths):
+                return True
+            # Not in allowed scope: still fine when it is a host-rendered
+            # contract document with unmodified content.
+            return (
+                path in contract_hashes
+                and current_state.get(path) == contract_hashes.get(path)
+            )
+
+        deliverable_files = sorted(
+            path
+            for path in changed - set(mixed)
+            if deliverable(path)
+            and not any(
+                path_matches(path, pattern)
+                for pattern in plan.change_policy.protected_paths
+                if not (
+                    path in contract_hashes
+                    and current_state.get(path) == contract_hashes.get(path)
+                )
+            )
+        )
+        excluded = sorted((changed - set(mixed)) - set(deliverable_files))
+        warnings = [
+            f"not staged (mixed with pre-existing user edits): {path}" for path in mixed
+        ] + [f"not staged (outside the allowed scope): {path}" for path in excluded]
+        return deliverable_files, warnings
+
+    def _record_contract_hashes(self, run_id: str, updates: dict[str, str]) -> None:
+        artifact = self.store.load_git_artifact(run_id, "contract-hashes") or {}
+        artifact.update(updates)
+        self.store.save_git_artifact(run_id, "contract-hashes", artifact)
+
     def _deliver(
         self, record: RunRecord, plan: PlannerPlan, round_record: RoundRecord, reason: str
     ) -> OrchestratorResult:
         record.status = RunStatus.ACCEPTED
         self.store.save_run(record, active_status=RunStatus.ACCEPTED)
-        owned = sorted(
-            {
-                path
-                for number, saved in self.store.load_rounds(record.run_id).items()
-                for path in saved.changed_files
-            }
-        )
+        owned, ownership_warnings = self._owned_delivery_files(record, plan)
+        for warning in ownership_warnings:
+            self._info(f"delivery: {warning}")
         github_result = None
         if self.config.github.enabled:
             if self.deliverer is None:
                 self._info("github delivery is enabled but no deliverer is configured")
+            elif not owned:
+                github_result = {
+                    "skipped": True,
+                    "reason": "no deliverable owned files",
+                    "warnings": list(ownership_warnings),
+                }
+                self.store.save_git_artifact(record.run_id, "delivery", github_result)
             else:
                 self._phase("github_delivery", "Delivering accepted work to git/GitHub.")
                 record.status = RunStatus.GITHUB_DELIVERY
                 self.store.save_run(record, active_status=RunStatus.GITHUB_DELIVERY)
                 github_result = dict(self.deliverer.deliver(record.run_id, owned) or {})
+                github_result.setdefault("warnings", []).extend(ownership_warnings)
                 self.store.save_git_artifact(record.run_id, "delivery", github_result)
                 if (
                     github_result.get("checks_failed")
                     and self.config.github.wait_for_checks
-                    and "ci-rework" not in round_record.notes
                 ):
-                    # Required remote checks failed: return to tester evidence
-                    # and planner review exactly once before giving up.
-                    round_record.notes.append(
-                        "ci-rework: remote required checks failed; "
-                        "rerunning tester evidence and planner review"
+                    if not any(note.startswith("ci-rework") for note in round_record.notes):
+                        # Required remote checks failed: return to tester
+                        # evidence and planner review exactly once.
+                        round_record.notes.append(
+                            "ci-rework: remote required checks failed; "
+                            "rerunning tester evidence and planner review"
+                        )
+                        self.store.save_round(record.run_id, round_record)
+                        record.status = RunStatus.TESTING
+                        self.store.save_run(record, active_status=RunStatus.TESTING)
+                        self._info(
+                            "remote required checks failed; returning to tester "
+                            "evidence and planner review"
+                        )
+                        return _RoundOutcome(round_record)
+                    # The rework loop already ran once: an operator decides.
+                    return self._finalize(
+                        record,
+                        RunStatus.HUMAN_REVIEW_REQUIRED,
+                        "remote required checks failed again after rework; "
+                        "the local implementation stays accepted but needs an "
+                        "operator decision on delivery",
+                        "Remote CI failed twice; nothing was invalidated locally.",
+                        warnings=["ci checks failed after the CI rework round"],
+                        github=github_result,
                     )
-                    self.store.save_round(record.run_id, round_record)
-                    record.status = RunStatus.TESTING
-                    self.store.save_run(record, active_status=RunStatus.TESTING)
-                    self._info(
-                        "remote required checks failed; returning to tester "
-                        "evidence and planner review"
-                    )
-                    return _RoundOutcome(round_record)
-        warnings: list[str] = []
+        warnings: list[str] = list(ownership_warnings)
         if round_record.coding_result is not None:
             warnings.extend(
                 f"known limitation: {item}"
@@ -570,6 +773,7 @@ class Orchestrator:
             self._stage_attempts[stage] = self._stage_attempts.get(stage, 0) + 1
             attempt = self._stage_attempts[stage]
             context_fields = dict(extra or {})
+            context_fields.setdefault("policy", self.config.policy)
             context = HarnessContext(
                 requirement=record.requirement,
                 run_id=record.run_id,
@@ -678,7 +882,7 @@ class Orchestrator:
 
     # --- human-readable documents -------------------------------------------------------
 
-    def _render_contract_docs(self, requirement: str, plan: PlannerPlan) -> None:
+    def _render_contract_docs(self, run_id: str, requirement: str, plan: PlannerPlan) -> None:
         criteria = "\n".join(
             f"- **{c.id}** ({c.priority}): {c.description} — verify by: {c.verification_method}"
             for c in plan.acceptance_criteria
@@ -716,8 +920,23 @@ class Orchestrator:
             f"## Tasks\n\n{tasks}\n",
         )
         self.store.write_doc("ACCEPTANCE.md", f"# Acceptance Criteria\n\n{criteria}\n")
+        docs_relative = "docs/metacoding"
+        self._record_contract_hashes(
+            run_id,
+            {
+                f"{docs_relative}/{name}": _file_digest(
+                    self.project_root / docs_relative / name
+                )
+                for name in (
+                    "PRD.md",
+                    "ARCHITECTURE.md",
+                    "IMPLEMENTATION_PLAN.md",
+                    "ACCEPTANCE.md",
+                )
+            },
+        )
 
-    def _render_test_report(self, report: TesterReport, round_number: int) -> None:
+    def _render_test_report(self, run_id: str, report: TesterReport, round_number: int) -> None:
         commands = "\n".join(
             f"- `{command.command}` -> exit {command.exit_code}: {command.summary}"
             for command in report.test_commands
@@ -744,6 +963,14 @@ class Orchestrator:
             + ("\n".join(f"- {item}" for item in report.missing_tests) or "- (none)")
             + "\n",
         )
+        self._record_contract_hashes(
+            run_id,
+            {
+                "docs/metacoding/TEST_REPORT.md": _file_digest(
+                    self.project_root / "docs" / "metacoding" / "TEST_REPORT.md"
+                )
+            },
+        )
 
     def _render_final_report(self, final: FinalReport) -> None:
         artifacts = "\n".join(f"- {name}: `{path}`" for name, path in final.artifacts.items())
@@ -759,6 +986,11 @@ class Orchestrator:
             f"## Rounds used\n\n{final.rounds_used}\n\n## Artifacts\n\n{artifacts}\n\n"
             f"## Warnings\n\n{warnings}\n\n## GitHub\n\n{github}\n",
         )
+
+
+def _file_digest(path: Path) -> str:
+    """Content hash used to prove a host-rendered document was not tampered with."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def fingerprint_scope_violation(details) -> str:

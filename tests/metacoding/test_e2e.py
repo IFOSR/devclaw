@@ -267,6 +267,10 @@ def test_max_rounds_blocks_e2e(tmp_path: Path) -> None:
         default_attempts(review=[review_step("rework")]),
         max_rounds=2,
     )
+    (root / "tests").mkdir(exist_ok=True)
+    (root / "tests" / "test_audit.py").write_text(
+        "def test_audit():\n    assert False\n", encoding="utf-8"
+    )
     result = MetaCodingService(project_root=root).run("add audit logging")
     assert result.exit_code == EXIT_RUN_REJECTED
     run_dir = next((root / ".metacoding" / "runs").iterdir())
@@ -308,14 +312,17 @@ def test_tester_contamination_blocks_e2e(tmp_path: Path) -> None:
 
 
 def test_resume_completes_persisted_run_e2e(tmp_path: Path) -> None:
+    from metacoding.config import load_config
     from metacoding.models import ProjectSnapshot, now_utc
     from metacoding.persistence import RunStore
 
     root = make_project(tmp_path, default_attempts())
     store = RunStore(root)
+    # snapshot the project's ACTUAL (fake-harness) configuration so resume
+    # rebuilds the same harnesses the run started with
     record = store.create_run(
         "add audit logging",
-        default_config(),
+        load_config(root),
         ProjectSnapshot(
             captured_at=now_utc(),
             is_git_repo=False,
@@ -349,7 +356,8 @@ def test_github_fake_delivery_local_branch_e2e(tmp_path: Path) -> None:
     run_dir = next((root / ".metacoding" / "runs").iterdir())
     delivery = json.loads((run_dir / "git" / "delivery.json").read_text("utf-8"))
     assert delivery["pushed"] is False
-    assert delivery["committed_files"] == ["src/audit.py"]
+    assert "src/audit.py" in delivery["committed_files"]
+    assert "user-notes.txt" not in delivery["committed_files"]
     listed = subprocess.run(
         ["git", "-C", str(root), "ls-tree", "-r", "--name-only", delivery["branch"]],
         capture_output=True,
@@ -405,3 +413,137 @@ def test_active_run_lock_blocks_second_start_e2e(tmp_path: Path) -> None:
         outcome = service.run("another requirement")
         assert outcome.exit_code == 3
         assert "already active" in outcome.message
+
+
+# --- host-executed deterministic verification ---------------------------------------
+
+
+def test_host_executed_checks_override_lying_tester(tmp_path: Path) -> None:
+    # The project has a real failing pytest suite; the fake tester lies and
+    # reports success. The host runs the detected command itself, so the
+    # deterministic gate must fail until round 2 actually fixes the test.
+    root = make_project(
+        tmp_path,
+        default_attempts(
+            code=[
+                # round 1: implement feature but ship a failing test
+                code_step(
+                    files={
+                        "src/audit.py": "def log(): pass\n",
+                        "tests/test_audit.py": "def test_audit():\n    assert False\n",
+                    }
+                ),
+                # round 2: fix the test
+                code_step(
+                    files={
+                        "src/audit.py": "def log(): pass\n",
+                        "tests/test_audit.py": "def test_audit():\n    assert True\n",
+                    }
+                ),
+            ],
+            review=[review_step("accept"), review_step("accept")],
+        ),
+        max_rounds=3,
+    )
+    # the failing test exists BEFORE the run starts so the host detects and
+    # executes the project's own test command
+    (root / "tests").mkdir(exist_ok=True)
+    (root / "tests" / "test_audit.py").write_text(
+        "def test_audit():\n    assert False\n", encoding="utf-8"
+    )
+    result = MetaCodingService(project_root=root).run("add audit logging")
+    assert result.exit_code == EXIT_OK
+    run_dir = next((root / ".metacoding" / "runs").iterdir())
+    host_checks = json.loads(
+        (run_dir / "rounds" / "round-001" / "host-checks.json").read_text("utf-8")
+    )
+    assert host_checks["checks"][0]["exit_code"] != 0  # host really executed it
+    final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+    assert final["rounds_used"] == 2
+    assert any(
+        "deterministic" in warning.lower() or "host" in warning.lower()
+        for warning in final["warnings"]
+    )
+
+
+def test_host_check_failure_with_no_fix_blocks(tmp_path: Path) -> None:
+    root = make_project(
+        tmp_path,
+        default_attempts(
+            code=[
+                code_step(files={"src/audit.py": "def log(): pass\n",
+                                 "tests/test_audit.py": "def test_audit():\n    assert False\n"})
+            ],
+            review=[review_step("accept")],
+        ),
+        max_rounds=2,
+    )
+    (root / "tests").mkdir(exist_ok=True)
+    (root / "tests" / "test_audit.py").write_text(
+        "def test_audit():\n    assert False\n", encoding="utf-8"
+    )
+    result = MetaCodingService(project_root=root).run("add audit logging")
+    assert result.exit_code == EXIT_RUN_REJECTED
+    run_dir = next((root / ".metacoding" / "runs").iterdir())
+    final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+    assert final["outcome"] == "blocked"
+
+
+# --- owned-diff delivery hardening ----------------------------------------------------
+
+
+def _git_project(tmp_path: Path, attempts: dict, **kwargs) -> Path:
+    return make_project(tmp_path, attempts, git_init=True, **kwargs)
+
+
+def test_mixed_preexisting_dirty_file_is_never_committed(tmp_path: Path) -> None:
+    root = _git_project(
+        tmp_path,
+        default_attempts(
+            # the coder edits a file that was already dirty before the run
+            code=[code_step(files={"src/audit.py": "def log(): pass\n",
+                                   "user-notes.txt": "user edits + coder edits\n"})],
+        ),
+        github={"enabled": True, "auto_push": False, "auto_create_pr": False},
+    )
+    # make user-notes.txt dirty BEFORE the run starts
+    (root / "user-notes.txt").write_text("user's own work\n", encoding="utf-8")
+    result = MetaCodingService(project_root=root).run("add audit logging")
+    assert result.exit_code == EXIT_OK
+    run_dir = next((root / ".metacoding" / "runs").iterdir())
+    delivery = json.loads((run_dir / "git" / "delivery.json").read_text("utf-8"))
+    assert "user-notes.txt" not in delivery["committed_files"]
+    assert "src/audit.py" in delivery["committed_files"]
+    assert any("mixed" in warning.lower() for warning in delivery["warnings"])
+    listed = subprocess.run(
+        ["git", "-C", str(root), "ls-tree", "-r", "--name-only", delivery["branch"]],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "user-notes.txt" not in listed
+
+
+def test_out_of_scope_round1_file_is_not_delivered_after_clean_round2(tmp_path: Path) -> None:
+    root = _git_project(
+        tmp_path,
+        default_attempts(
+            code=[
+                code_step(files={"src/audit.py": "def log(): pass\n",
+                                 "outside/scope.py": "x = 1\n"}),
+                code_step(files={"src/audit.py": "def log(): pass\n"}),
+            ],
+            review=[review_step("rework"), review_step("accept")],
+        ),
+        github={"enabled": True, "auto_push": False, "auto_create_pr": False},
+        max_rounds=3,
+    )
+    result = MetaCodingService(project_root=root).run("add audit logging")
+    assert result.exit_code == EXIT_OK
+    run_dir = next((root / ".metacoding" / "runs").iterdir())
+    delivery = json.loads((run_dir / "git" / "delivery.json").read_text("utf-8"))
+    assert "outside/scope.py" not in delivery["committed_files"]
+    assert "src/audit.py" in delivery["committed_files"]
+    listed = subprocess.run(
+        ["git", "-C", str(root), "ls-tree", "-r", "--name-only", delivery["branch"]],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "outside/scope.py" not in listed
