@@ -8,6 +8,8 @@ and are never written back to the project file. Secrets are rejected.
 from __future__ import annotations
 
 import argparse
+import json
+import re
 
 try:  # Python 3.11+
     import tomllib
@@ -476,6 +478,182 @@ def apply_cli_overrides(config: ProjectConfig, overrides: CliOverrides) -> Proje
     if overrides is None:
         return config
     return _apply_overrides(config, overrides)
+
+
+# --- persistent key/value management (metacoding config set/get/list) ---------------
+
+#: User-facing keys accepted by `metacoding config`. Harness keys have short
+#: aliases (planner.model) and full forms (harness.planner.model).
+CONFIG_SECTION_KEYS: dict[str, tuple[str, str]] = {
+    "limits.max_rounds": ("limits", "max_rounds"),
+    "limits.same_failure_limit": ("limits", "same_failure_limit"),
+    "limits.idle_timeout_seconds": ("limits", "idle_timeout_seconds"),
+    "limits.max_execution_seconds": ("limits", "max_execution_seconds"),
+    "policy.allow_network": ("policy", "allow_network"),
+    "policy.allow_destructive_commands": ("policy", "allow_destructive_commands"),
+    "policy.tester_can_modify_source": ("policy", "tester_can_modify_source"),
+    "github.enabled": ("github", "enabled"),
+    "github.remote": ("github", "remote"),
+    "github.mode": ("github", "mode"),
+    "github.branch_prefix": ("github", "branch_prefix"),
+    "github.auto_commit": ("github", "auto_commit"),
+    "github.auto_push": ("github", "auto_push"),
+    "github.auto_create_pr": ("github", "auto_create_pr"),
+    "github.wait_for_checks": ("github", "wait_for_checks"),
+    "github.check_timeout_seconds": ("github", "check_timeout_seconds"),
+    "github.check_poll_seconds": ("github", "check_poll_seconds"),
+}
+for _harness in ("planner", "coder", "tester"):
+    for _field in ("provider", "command", "model", "extra_args"):
+        CONFIG_SECTION_KEYS[f"{_harness}.{_field}"] = (f"harness.{_harness}", _field)
+        CONFIG_SECTION_KEYS[f"harness.{_harness}.{_field}"] = (f"harness.{_harness}", _field)
+
+
+def resolve_config_key(key: str) -> tuple[str, str]:
+    """Normalize a user key to ``(section, leaf)`` or raise ConfigError."""
+    try:
+        return CONFIG_SECTION_KEYS[key.strip()]
+    except KeyError:
+        raise ConfigError(
+            f"unknown config key {key!r}; manageable keys: "
+            f"planner/coder/tester.{{provider,command,model,extra_args}}, "
+            f"limits.*, policy.*, github.*"
+        ) from None
+
+
+def read_raw_config(project_root: Path) -> dict:
+    """Raw TOML content of the project config (empty when absent)."""
+    path = Path(project_root) / ".metacoding" / "config.toml"
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, "rb") as handle:
+            data = tomllib.load(handle)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"invalid TOML in {path}: {exc}") from exc
+    return data if isinstance(data, dict) else {}
+
+
+def _coerce_config_value(text: str):
+    """Coerce a CLI value string: bool/int stay typed, quoted strings and
+    inline arrays parse as TOML, everything else is a bare string."""
+    stripped = text.strip()
+    if not stripped:
+        raise ConfigError("config value must not be empty")
+    if stripped[0] in "[\"'":
+        try:
+            return tomllib.loads(f"v = {stripped}")["v"]
+        except Exception:
+            if stripped.startswith("[") and stripped.endswith("]"):
+                # Friendly CLI list syntax: [--flag-a, --flag-b] as bare tokens.
+                items = [item.strip() for item in stripped[1:-1].split(",")]
+                items = [item for item in items if item]
+                if items and all(item for item in items):
+                    return items
+            raise ConfigError(f"cannot parse config value {text!r}") from None
+    lowered = stripped.lower()
+    if lowered in ("true", "false"):
+        return lowered == "true"
+    try:
+        return int(stripped)
+    except ValueError:
+        return stripped
+
+
+def _dump_toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_dump_toml_value(item) for item in value) + "]"
+    return json.dumps(str(value))
+
+
+def _write_toml_key(text: str, section: str, leaf: str, dumped_value: str) -> str:
+    """Rewrite one key inside its TOML section, preserving everything else."""
+    lines = text.splitlines()
+    header_pattern = re.compile(rf"^\s*\[\s*{re.escape(section)}\s*\]\s*$")
+    next_header = re.compile(r"^\s*\[")
+    key_pattern = re.compile(rf"^\s*{re.escape(leaf)}\s*=")
+
+    header_index = None
+    for index, line in enumerate(lines):
+        if header_pattern.match(line):
+            header_index = index
+            break
+
+    replacement = f"{leaf} = {dumped_value}"
+    if header_index is None:
+        base = text.rstrip("\n")
+        new_text = (base + "\n\n" if base else "") + f"[{section}]\n{replacement}\n"
+        return new_text
+
+    end = len(lines)
+    for index in range(header_index + 1, len(lines)):
+        if next_header.match(lines[index]):
+            end = index
+            break
+    for index in range(header_index + 1, end):
+        if key_pattern.match(lines[index]):
+            lines[index] = replacement
+            return "\n".join(lines) + "\n"
+    lines.insert(header_index + 1, replacement)
+    return "\n".join(lines) + "\n"
+
+
+def set_config_value(project_root: Path, key: str, value: str) -> ProjectConfig:
+    """Persist ``key = value`` in ``.metacoding/config.toml``.
+
+    The write is validated by reloading the merged configuration; on any
+    validation error the previous file content is restored.
+    """
+    section, leaf = resolve_config_key(key)
+    coerced = _coerce_config_value(value)
+    path = Path(project_root) / ".metacoding" / "config.toml"
+    original = path.read_text(encoding="utf-8") if path.is_file() else ""
+    new_text = _write_toml_key(original, section, leaf, _dump_toml_value(coerced))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(new_text, encoding="utf-8")
+    try:
+        return load_config(project_root)
+    except ConfigError:
+        if original:
+            path.write_text(original, encoding="utf-8")
+        else:
+            path.unlink(missing_ok=True)
+        raise
+
+
+def effective_config_settings(config: ProjectConfig, raw: dict) -> dict[str, tuple[object, str]]:
+    """Flat ``dotted.key -> (value, source)`` view for get/list."""
+    snapshot = config.to_dict()
+    settings: dict[str, tuple[object, str]] = {}
+    for harness_name, values in snapshot["harness"].items():
+        raw_section = (raw.get("harness") or {}).get(harness_name) or {}
+        if not isinstance(raw_section, dict):
+            raw_section = {}
+        for field, value in values.items():
+            source = "config.toml" if field in raw_section else "default"
+            settings[f"harness.{harness_name}.{field}"] = (value, source)
+    for section in ("limits", "policy", "github"):
+        raw_section = raw.get(section) or {}
+        if not isinstance(raw_section, dict):
+            raw_section = {}
+        for field, value in snapshot[section].items():
+            source = "config.toml" if field in raw_section else "default"
+            settings[f"{section}.{field}"] = (value, source)
+    return settings
+
+
+def format_config_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value) if value else "(empty)"
+    if value == "":
+        return "(cli default)"
+    return str(value)
 
 
 def load_config(

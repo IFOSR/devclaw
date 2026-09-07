@@ -125,6 +125,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_simple("artifacts", "list artifact paths of a run", run_id=True)
     add_simple("cancel", "cancel the active run")
     add_simple("deliver", "deliver an accepted run to git/GitHub", run_id=True)
+
+    config_parser = subparsers.add_parser(
+        "config", help="manage persistent project configuration (.metacoding/config.toml)"
+    )
+    config_parser.add_argument(
+        "action", choices=["list", "get", "set"], help="list / get KEY / set KEY VALUE"
+    )
+    config_parser.add_argument("key", nargs="?", help="dotted key, e.g. coder.model")
+    config_parser.add_argument("value", nargs="?", help="value for `set`")
+    _add_harness_overrides(config_parser, suppress=True)
     return parser
 
 
@@ -159,6 +169,19 @@ def dispatch(app: App, args: argparse.Namespace) -> int:
         outcome = app.cancel()
     elif args.command == "deliver":
         outcome = app.deliver(getattr(args, "run_id", None))
+    elif args.command == "config":
+        if args.action == "list":
+            outcome = app.config_list()
+        elif args.action == "get":
+            if not args.key:
+                print("usage: metacoding config get KEY", file=sys.stderr)
+                return EXIT_USAGE
+            outcome = app.config_get(args.key)
+        else:  # set
+            if not args.key or args.value is None:
+                print("usage: metacoding config set KEY VALUE", file=sys.stderr)
+                return EXIT_USAGE
+            outcome = app.config_set(args.key, args.value)
     else:  # pragma: no cover - argparse rejects unknown commands first
         print(f"Unknown command: {args.command}", file=sys.stderr)
         return EXIT_USAGE

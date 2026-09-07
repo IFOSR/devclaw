@@ -189,6 +189,54 @@ class MetaCodingService:
         lines = [f"- {key}: {value}" for key, value in summary.items()]
         return Outcome("delivered", EXIT_OK, f"delivered run {target}", lines, run_id=target)
 
+    # --- persistent configuration management ----------------------------------
+
+    def config_set(self, key: str, value: str) -> Outcome:
+        from metacoding.config import set_config_value
+
+        try:
+            set_config_value(self.project_root, key, value)
+        except MetaCodingError as exc:
+            return Outcome("error", EXIT_USAGE, str(exc))
+        return Outcome(
+            "set", EXIT_OK, f"{key} written to .metacoding/config.toml"
+        )
+
+    def _settings(self) -> dict:
+        from metacoding.config import effective_config_settings, read_raw_config
+
+        return effective_config_settings(self._config(), read_raw_config(self.project_root))
+
+    def config_get(self, key: str) -> Outcome:
+        from metacoding.config import format_config_value, resolve_config_key
+
+        try:
+            section, leaf = resolve_config_key(key)
+        except MetaCodingError as exc:
+            return Outcome("error", EXIT_USAGE, str(exc))
+        dotted = f"{section}.{leaf}"
+        entry = self._settings().get(dotted)
+        if entry is None:
+            return Outcome("error", EXIT_USAGE, f"unknown config key {key!r}")
+        value, source = entry
+        return Outcome(
+            "get",
+            EXIT_OK,
+            f"{key.strip()} = {format_config_value(value)}",
+            [f"source: {source}"],
+        )
+
+    def config_list(self) -> Outcome:
+        from metacoding.config import format_config_value
+
+        settings = self._settings()
+        width = max(len(key) for key in settings)
+        lines = [
+            f"{key.ljust(width)}  {format_config_value(value)}  [{source}]"
+            for key, (value, source) in sorted(settings.items())
+        ]
+        return Outcome("list", EXIT_OK, "effective project configuration", lines)
+
     # --- inspection ------------------------------------------------------------------
 
     def overview(self) -> list[str]:

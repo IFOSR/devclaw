@@ -50,10 +50,32 @@ metacoding report [--run-id ID] final report of a run
 metacoding artifacts [--run-id ID] artifact paths of a run
 metacoding cancel               cancel the active run
 metacoding deliver [--run-id ID] deliver an accepted run to git/GitHub
+metacoding config list          show effective configuration + source
+metacoding config get KEY       show one setting (e.g. coder.model)
+metacoding config set KEY VALUE  persist a setting to .metacoding/config.toml
 ```
 
 TUI commands: `/status`, `/report`, `/artifacts`, `/resume`, `/cancel`,
-`/deliver`, `/help`, `/exit`. Type any other text to start a run.
+`/deliver`, `/config [get KEY | set KEY VALUE]`, `/help`, `/exit`. Type any
+other text to start a run.
+
+### Setting models persistently
+
+```bash
+metacoding config set planner.model gpt-5.1-codex-max
+metacoding config set coder.model  code-cli/gpt-5.6-sol
+metacoding config set tester.model gpt-5.1-codex
+metacoding config get coder.model           # value + where it comes from
+metacoding config set limits.max_rounds 4   # numbers/booleans are typed
+metacoding config set github.auto_push true
+```
+
+`config set` edits only the named key inside `.metacoding/config.toml`
+(comments and other sections are preserved), validates the result by
+reloading the merged configuration, and rolls the file back if the value
+is rejected. Harness keys accept short (`coder.model`) and full
+(`harness.coder.model`) forms; managed keys cover `planner/coder/tester.*`,
+`limits.*`, `policy.*`, and `github.*`. Secret fields are never writable.
 
 ## Configuration
 
@@ -80,7 +102,9 @@ model = "tester-model"       # independent of the planner model
 See [docs/metacoding/config.example.toml](docs/metacoding/config.example.toml)
 for the full schema (limits, policy, GitHub). Precedence is
 built-in defaults → `.metacoding/config.toml` → command-line overrides.
-Overrides apply to the current invocation only and are never written back:
+`metacoding config set KEY VALUE` persists to the config file;
+`--*-model/--*-command/--max-rounds` overrides apply to the current
+invocation only and are never written back:
 
 ```text
 --planner-model MODEL   --planner-command PATH

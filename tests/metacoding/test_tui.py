@@ -53,6 +53,24 @@ class FakeApp:
         self.calls.append(("deliver", run_id))
         return Outcome(status="delivered", exit_code=EXIT_OK, message="delivered")
 
+    def config_list(self) -> Outcome:
+        self.calls.append(("config_list",))
+        return Outcome(
+            status="ok", exit_code=EXIT_OK, message="config",
+            lines=["harness.coder.model         (cli default)  [default]",
+                   "harness.tester.model        (cli default)  [default]"],
+        )
+
+    def config_get(self, key: str) -> Outcome:
+        self.calls.append(("config_get", key))
+        return Outcome(status="ok", exit_code=EXIT_OK, message=f"{key} = (cli default)",
+                       lines=["source: default"])
+
+    def config_set(self, key: str, value: str) -> Outcome:
+        self.calls.append(("config_set", key, value))
+        return Outcome(status="set", exit_code=EXIT_OK,
+                       message=f"{key} written to .metacoding/config.toml")
+
 
 def drive(app: FakeApp, text: str) -> str:
     stdin = io.StringIO(text)
@@ -141,3 +159,17 @@ def test_raw_model_output_is_not_dumped(capsys) -> None:
     output = drive(app, "build feature\n/exit\n")
     # only concise lifecycle lines, not full harness dumps
     assert "plan-payload" not in output
+
+
+def test_config_command_in_tui() -> None:
+    app = FakeApp()
+    output = drive(app, "/config\n/config get coder.model\n/config set coder.model m-1\n/config\n/exit\n")
+    assert ("config_list",) in app.calls
+    assert ("config_get", "coder.model") in app.calls
+    assert ("config_set", "coder.model", "m-1") in app.calls
+    assert "harness.tester.model" in output
+
+
+def test_config_bad_usage_shows_hint() -> None:
+    output = drive(FakeApp(), "/config set only-key\n/exit\n")
+    assert "usage: /config" in output

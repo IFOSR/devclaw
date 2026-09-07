@@ -23,6 +23,7 @@ HELP = """Commands:
   /resume              resume the interrupted run
   /cancel              cancel the active run
   /deliver [run-id]    deliver an accepted run
+  /config [get KEY|set KEY VALUE]  manage persistent configuration
   /help                show this help
   /exit                leave MetaCoding"""
 
@@ -96,6 +97,19 @@ def run_tui(app: App, *, stdin: IO[str] | None = None, stdout: IO[str] | None = 
                 _print_outcome(stdout, app.resume(emit=emit))
             elif name == "cancel":
                 _print_outcome(stdout, app.cancel())
+            elif name == "config":
+                # /config            -> list
+                # /config get KEY   -> show one key
+                # /config set K V   -> persist to .metacoding/config.toml
+                rest = command[len("/config"):].strip().split()
+                if not rest:
+                    _print_outcome(stdout, app.config_list())
+                elif rest[0] == "get" and len(rest) == 2:
+                    _print_outcome(stdout, app.config_get(rest[1]))
+                elif rest[0] == "set" and len(rest) >= 3:
+                    _print_outcome(stdout, app.config_set(rest[1], " ".join(rest[2:])))
+                else:
+                    _print(stdout, "usage: /config [get KEY | set KEY VALUE]")
             elif name in RUN_ID_COMMANDS:
                 method = getattr(app, name)
                 _print_outcome(stdout, method(run_id))
