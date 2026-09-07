@@ -86,6 +86,7 @@ class HarnessContext:
     test_commands: list[str] = field(default_factory=list)
     host_checks: list[dict] = field(default_factory=list)
     policy: Any = None
+    max_execution_seconds: float | None = None
     transcript_sink: Callable[[str, CommandResult], None] | None = None
 
     @property
@@ -193,14 +194,17 @@ class Harness(ABC):
             command,
             cwd=self.project_root,
             idle_timeout_seconds=ctx.idle_timeout_seconds,
+            max_execution_seconds=ctx.max_execution_seconds,
             env=self.invocation_env(),
         )
         if ctx.transcript_sink is not None:
             ctx.transcript_sink(stage, result)
         if result.timed_out:
+            reason = "no output" if result.limit_reason != "total" else "exceeded its total time limit"
             raise HarnessTimeout(
-                f"{self.provider}-{self.name} produced no output for "
-                f"{result.idle_timeout_seconds:.0f}s and was terminated",
+                f"{self.provider}-{self.name} {reason} for "
+                f"{result.idle_timeout_seconds:.0f}s idle / "
+                f"{ctx.max_execution_seconds or 0:.0f}s total and was terminated",
                 command=command,
                 idle_seconds=result.idle_timeout_seconds,
             )

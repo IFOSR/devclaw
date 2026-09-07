@@ -156,17 +156,39 @@ class MetaCodingService:
                 f"run {target} ended as {final.outcome}; nothing to deliver",
             )
         try:
+            from metacoding.config import ProjectConfig, apply_cli_overrides
             from metacoding.github import GitDeliverer
+            from metacoding.orchestrator import compute_owned_delivery_files
 
-            config = self._config()
-            deliverer = GitDeliverer(self.project_root, config)
-            summary = deliverer.deliver(
-                target, owned_files=sorted(_owned_files(self.store, target))
+            record = self.store.load_run(target)
+            plan = self.store.load_plan(target)
+            if plan is None:
+                raise MetaCodingError(f"run {target} has no planner plan to derive scope from")
+            # Manual delivery follows the SAME owned-diff rules as the
+            # automatic path: baseline content diff, mixed-file exclusion,
+            # planner scope, and host-protected paths.
+            config = apply_cli_overrides(
+                ProjectConfig.from_dict(record.config_snapshot), self.overrides
             )
+            deliverer = GitDeliverer(self.project_root, config)
+            owned, warnings = compute_owned_delivery_files(
+                self.project_root, self.store, record, plan
+            )
+            if not owned:
+                return Outcome(
+                    "delivered",
+                    EXIT_OK,
+                    f"nothing deliverable for run {target}",
+                    list(warnings) or ["no deliverable owned files"],
+                    run_id=target,
+                )
+            summary = deliverer.deliver(target, owned_files=owned)
+            summary.setdefault("warnings", []).extend(warnings)
+            self.store.save_git_artifact(target, "delivery", summary)
         except MetaCodingError as exc:
-            return Outcome("error", EXIT_USAGE, f"delivery failed: {exc}")
+            return Outcome("error", EXIT_USAGE, f"delivery failed: {exc}", run_id=target)
         lines = [f"- {key}: {value}" for key, value in summary.items()]
-        return Outcome("delivered", EXIT_OK, f"delivered run {target}", lines)
+        return Outcome("delivered", EXIT_OK, f"delivered run {target}", lines, run_id=target)
 
     # --- inspection ------------------------------------------------------------------
 

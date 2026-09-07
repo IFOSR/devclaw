@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from dataclasses import dataclass, field, replace
@@ -463,9 +464,11 @@ class ChecksFailOnce:
     def __init__(self) -> None:
         self.calls = 0
         self.tester_runs = 0
+        self.last_owned: list[str] = []
 
     def deliver(self, run_id: str, owned_files: list[str]) -> dict:
         self.calls += 1
+        self.last_owned = list(owned_files)
         return {
             "branch": f"metacoding/{run_id}",
             "commit": "sha",
@@ -490,7 +493,11 @@ def test_failed_required_checks_return_run_to_review_then_deliver(tmp_path: Path
     tester.test = counting_test
     result = orchestrator.start("add audit logging")
     assert result.status.value == "delivered"
-    assert deliverer.calls == 2
+    main_deliveries = [
+        call for call in range(deliverer.calls)
+        if deliverer.last_owned != ["docs/metacoding/FINAL_REPORT.md"]
+    ] if hasattr(deliverer, "last_owned") else None
+    assert deliverer.calls == 3  # 2 deliveries + final-report commit
     assert deliverer.tester_runs == 2
     assert result.final.rounds_used == 1  # stayed on the same round
     assert any("ci" in warning.lower() for warning in result.final.warnings)
@@ -511,7 +518,7 @@ def test_checks_ignored_without_wait_for_checks(tmp_path: Path) -> None:
     orchestrator.config = config
     result = orchestrator.start("add audit logging")
     assert result.status.value == "delivered"
-    assert deliverer.calls == 1
+    assert deliverer.calls == 2  # 1 delivery + final-report commit
 
 
 # --- check parsing, polling, and delivery modes --------------------------------------
@@ -606,3 +613,36 @@ def test_mode_branch_never_creates_pr(tmp_path: Path) -> None:
     assert git_client.pushes == [("origin", "metacoding/run-1", False)]
     assert all(call[0] != "ensure_pr" for call in gh_client.calls)
     assert summary["pr"] is None
+
+
+# --- JSON check parsing --------------------------------------------------------------
+
+
+def test_gh_checks_json_with_spaced_names_and_cancel_bucket(tmp_path, monkeypatch) -> None:
+    from metacoding.github import GhClient
+
+    payload = json.dumps(
+        [
+            {"name": "Unit tests", "bucket": "fail", "state": "FAIL"},
+            {"name": "Lint", "bucket": "pass", "state": "PASS"},
+            {"name": "Deploy", "bucket": "cancel", "state": "CANCELLED"},
+            {"name": "Docs", "bucket": "skipping", "state": "SKIPPING"},
+        ]
+    )
+
+    class FakeResult:
+        returncode = 8
+        stdout = payload
+        stderr = ""
+
+    monkeypatch.setattr("metacoding.github.subprocess.run", lambda *a, **k: FakeResult())
+    checks = GhClient(tmp_path).checks("origin", "metacoding/run-1")
+    by_name = {check["name"]: check["state"] for check in checks}
+    assert by_name["Unit tests"] == "FAILURE"   # spaced name preserved
+    assert by_name["Lint"] == "SUCCESS"
+    assert by_name["Deploy"] == "CANCELLED"     # cancel bucket counts as failed
+    assert by_name["Docs"] == "SKIPPED"
+    # a cancelled required check fails delivery
+    from metacoding.github import SUCCESS_CHECK_STATES
+
+    assert any(state not in SUCCESS_CHECK_STATES for state in by_name.values())

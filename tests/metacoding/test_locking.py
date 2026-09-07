@@ -143,3 +143,68 @@ def test_lock_context_manager_releases_on_exception(tmp_path: Path) -> None:
         with project_lock(tmp_path, "run-1"):
             raise RuntimeError("boom")
     assert read_lock(tmp_path) is None
+
+
+# --- CAS takeover and owner-verified release ------------------------------------------
+
+
+def test_takeover_fails_while_another_process_holds_the_flock(tmp_path: Path) -> None:
+    import json as _json
+
+    path = lock_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # A dead pid in the file, but a live process holds the flock on it:
+    # the pid check alone would call it stale; the flock CAS must refuse.
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import fcntl, json, sys, time\n"
+                f"path = {str(path)!r}\n"
+                "with open(path, 'w') as f:\n"
+                "    json.dump({'run_id': 'ghost', 'pid': 999999, "
+                "'host': 'other-host', 'acquired_at': ''}, f)\n"
+                "    f.flush()\n"
+                "    fcntl.flock(f, fcntl.LOCK_EX)\n"
+                "    print('locked', flush=True)\n"
+                "    time.sleep(60)\n"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        with pytest.raises(LockError):
+            acquire_lock(tmp_path, "new-run", allow_stale_replacement=True)
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_release_never_deletes_a_successors_lock(tmp_path: Path) -> None:
+    handle = acquire_lock(tmp_path, "old-run")
+    # simulate takeover by someone else rewriting the file
+    write_lock(
+        tmp_path,
+        {
+            "run_id": "new-run",
+            "pid": os.getpid() + 1,
+            "host": socket.gethostname(),
+            "acquired_at": "2026-09-07T00:00:00Z",
+        },
+    )
+    assert handle.release() is False  # detected foreign content, kept the file
+    assert read_lock(tmp_path) is not None
+    assert read_lock(tmp_path).run_id == "new-run"
+
+
+def test_release_lock_verifies_expected_owner(tmp_path: Path) -> None:
+    with project_lock(tmp_path, "run-1"):
+        # wrong expected pid: untouched
+        assert release_lock(tmp_path, expected_pid=999999) is False
+        assert read_lock(tmp_path) is not None
+        # matching owner: removed
+        assert release_lock(tmp_path, expected_pid=os.getpid()) is True
+        assert read_lock(tmp_path) is None

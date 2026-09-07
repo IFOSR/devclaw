@@ -109,38 +109,60 @@ def severity_gate(report: TesterReport) -> GateResult:
     return GateResult("severity", True)
 
 
-def deterministic_checks_gate(
-    report: TesterReport, host_checks: list[dict] | None = None
-) -> GateResult:
-    """Gate over tester-reported AND host-executed deterministic checks.
+def _command_matches(report_command: str, required_command: str) -> bool:
+    """True when a tester-reported command is an invocation of a required
+    project test command (exact match or with extra arguments)."""
+    report_command = report_command.strip()
+    required_command = required_command.strip()
+    return report_command == required_command or report_command.startswith(
+        required_command + " "
+    )
 
-    The host executes the detected project test commands itself; a tester
-    report claiming success for a command the host saw fail is rejected as
-    inconsistent evidence.
+
+def deterministic_checks_gate(
+    report: TesterReport,
+    host_checks: list[dict] | None = None,
+    required_commands: list[str] | None = None,
+) -> GateResult:
+    """Gate over host-executed deterministic checks.
+
+    Only the host-detected *required* project test commands can fail this
+    gate. Diagnostic commands the tester happened to run (``git diff
+    --no-index``, ``grep``, ...) may legitimately exit non-zero as data and
+    never fail the gate. A tester report claiming success for a required
+    command the host saw fail is rejected as inconsistent evidence.
     """
-    failures: list[str] = [
-        f"{command.command} (exit {command.exit_code})"
-        for command in report.test_commands
-        if command.exit_code != 0
-    ]
+    required = [command.strip() for command in (required_commands or [])]
+    failures: list[str] = []
+
     host_by_command: dict[str, int] = {}
     for check in host_checks or []:
-        command_text = str(check.get("command", ""))
+        command_text = str(check.get("command", "")).strip()
         exit_code = int(check.get("exit_code", 0))
         host_by_command[command_text] = exit_code
         if exit_code != 0:
             failures.append(f"host: {command_text} (exit {exit_code})")
+
     for command in report.test_commands:
-        host_exit = host_by_command.get(command.command)
-        if (
-            host_exit is not None
-            and host_exit != 0
-            and command.exit_code == 0
-        ):
+        is_required = any(_command_matches(command.command, req) for req in required)
+        if not is_required:
+            continue  # diagnostic command: exit code is evidence, not a gate
+        host_exit = next(
+            (
+                host_by_command[host_command]
+                for host_command in host_by_command
+                if _command_matches(command.command, host_command)
+            ),
+            None,
+        )
+        if command.exit_code != 0:
+            failures.append(f"{command.command} (exit {command.exit_code})")
+        elif host_exit is not None and host_exit != 0:
             failures.append(
                 f"tester reported success for '{command.command}' but host "
                 f"execution failed (exit {host_exit})"
             )
+
     if failures:
         return GateResult(
             "deterministic_checks", False, "required test commands failed", tuple(failures)
@@ -214,6 +236,7 @@ def evaluate_acceptance(
     report: TesterReport,
     changed_files: Iterable[str],
     host_checks: list[dict] | None = None,
+    required_commands: list[str] | None = None,
 ) -> list[GateResult]:
     """All gates that must pass before a run may be delivered."""
     changed = list(changed_files)
@@ -222,10 +245,42 @@ def evaluate_acceptance(
         evidence_gate(plan, report),
         blocking_acceptance_gate(plan, report),
         severity_gate(report),
-        deterministic_checks_gate(report, host_checks),
+        deterministic_checks_gate(report, host_checks, required_commands),
         scope_gate(changed, plan.change_policy),
         protected_path_gate(changed, plan.change_policy),
     ]
+
+
+def write_scope_gate(
+    changed: Iterable[str],
+    *,
+    allowed_files: set[str] = frozenset(),
+    allowed_prefixes: tuple[str, ...] = (),
+    allowed_patterns: tuple[str, ...] = (),
+) -> GateResult:
+    """Check that only permitted paths were written during a harness stage.
+
+    ``allowed_files`` are exact paths (harness payload files),
+    ``allowed_prefixes`` directory prefixes (run/transcript directories), and
+    ``allowed_patterns`` planner-granted fnmatch patterns for product files.
+    Host-protected paths are never allowed.
+    """
+    violations = []
+    for path in sorted(set(changed)):
+        if path in allowed_files:
+            continue
+        if any(path.startswith(prefix) for prefix in allowed_prefixes):
+            continue
+        if not is_host_protected(path) and any(
+            path_matches(path, pattern) for pattern in allowed_patterns
+        ):
+            continue
+        violations.append(path)
+    if violations:
+        return GateResult(
+            "write_scope", False, "harness wrote outside its permitted scope", tuple(violations)
+        )
+    return GateResult("write_scope", True)
 
 
 def _normalize(text: str) -> str:

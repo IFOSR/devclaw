@@ -28,8 +28,9 @@ VALID_GITHUB_MODES = ("pull-request", "branch", "none")
 SECRET_FIELD_NAMES = {"token", "api_key", "apikey", "secret", "password", "client_secret"}
 
 #: Harness extra_args tokens the host rejects: sandbox level, config
-#: overrides, and automation flags must stay under host control.
-FORBIDDEN_EXTRA_ARGS = {
+#: overrides, writable-dir escapes, and automation flags must stay under
+#: host control. Both ``--flag value`` and ``--flag=value`` forms match.
+FORBIDDEN_EXTRA_ARG_BASES = {
     "-s",
     "--sandbox",
     "--danger-full-access",
@@ -39,7 +40,22 @@ FORBIDDEN_EXTRA_ARGS = {
     "-c",
     "--config",
     "--profile",
+    "--add-dir",
 }
+
+
+def extra_arg_violations(extra_args: list[str]) -> list[str]:
+    """Return extra_args entries that try to bypass host control.
+
+    Matches the token before ``=`` so ``--sandbox=danger-full-access`` and
+    ``--config=...`` are rejected like their split forms.
+    """
+    violations = []
+    for arg in extra_args:
+        base = arg.split("=", 1)[0].strip()
+        if base in FORBIDDEN_EXTRA_ARG_BASES:
+            violations.append(arg)
+    return violations
 
 
 @dataclass(frozen=True)
@@ -66,12 +82,14 @@ class LimitsConfig:
     max_rounds: int
     same_failure_limit: int
     idle_timeout_seconds: int
+    max_execution_seconds: int = 3600
 
     def to_dict(self) -> dict:
         return {
             "max_rounds": self.max_rounds,
             "same_failure_limit": self.same_failure_limit,
             "idle_timeout_seconds": self.idle_timeout_seconds,
+            "max_execution_seconds": self.max_execution_seconds,
         }
 
 
@@ -139,66 +157,50 @@ class ProjectConfig:
 
     @classmethod
     def from_dict(cls, snapshot: dict) -> "ProjectConfig":
-        """Rebuild a config from a persisted run snapshot (used on resume)."""
+        """Rebuild a config from a persisted run snapshot (used on resume).
+
+        The snapshot goes through the same validation as a loaded config
+        file, so a corrupted or tampered snapshot cannot smuggle invalid
+        providers, limits, or forbidden harness arguments into a resume.
+        """
+        if not isinstance(snapshot, dict):
+            raise ConfigError("config snapshot must be an object")
         base = default_config()
-        harness_raw = snapshot.get("harness", {})
-        harness = {
-            name: HarnessConfig(
-                name=name,
-                provider=str(section.get("provider", base.harness[name].provider)),
-                command=str(section.get("command", base.harness[name].command)),
-                model=str(section.get("model", base.harness[name].model)),
-                extra_args=[str(arg) for arg in section.get("extra_args", [])],
+        _check_secrets(snapshot)
+
+        schema_version = snapshot.get("schema_version", base.schema_version)
+        if not isinstance(schema_version, int) or schema_version != SCHEMA_VERSION:
+            raise ConfigError(
+                f"snapshot has unsupported schema_version {schema_version!r}; "
+                f"expected {SCHEMA_VERSION}"
             )
-            for name, section in harness_raw.items()
-            if name in base.harness
-        }
+
+        harness_raw = snapshot.get("harness", {})
+        if not isinstance(harness_raw, dict):
+            raise ConfigError("snapshot 'harness' must be an object")
+        # _merge_harness validates providers, commands, models, extra_args.
+        harness = _merge_harness(base.harness, harness_raw)
+
         limits_raw = snapshot.get("limits", {})
+        # Reuse _merge_limits by feeding the raw snapshot values through it.
+        merged_limits = _merge_limits(
+            base.limits,
+            limits_raw if isinstance(limits_raw, dict) else {},
+        )
         policy_raw = snapshot.get("policy", {})
+        policy = _merge_policy(
+            base.policy, policy_raw if isinstance(policy_raw, dict) else {}
+        )
         github_raw = snapshot.get("github", {})
+        github = _merge_github(
+            base.github, github_raw if isinstance(github_raw, dict) else {}
+        )
         return cls(
-            schema_version=int(snapshot.get("schema_version", SCHEMA_VERSION)),
-            limits=LimitsConfig(
-                max_rounds=int(limits_raw.get("max_rounds", base.limits.max_rounds)),
-                same_failure_limit=int(
-                    limits_raw.get("same_failure_limit", base.limits.same_failure_limit)
-                ),
-                idle_timeout_seconds=int(
-                    limits_raw.get("idle_timeout_seconds", base.limits.idle_timeout_seconds)
-                ),
-            ),
-            harness=harness or base.harness,
-            policy=PolicyConfig(
-                allow_network=bool(policy_raw.get("allow_network", base.policy.allow_network)),
-                allow_destructive_commands=bool(
-                    policy_raw.get(
-                        "allow_destructive_commands", base.policy.allow_destructive_commands
-                    )
-                ),
-                tester_can_modify_source=bool(
-                    policy_raw.get(
-                        "tester_can_modify_source", base.policy.tester_can_modify_source
-                    )
-                ),
-            ),
-            github=GithubConfig(
-                enabled=bool(github_raw.get("enabled", base.github.enabled)),
-                remote=str(github_raw.get("remote", base.github.remote)),
-                mode=str(github_raw.get("mode", base.github.mode)),
-                branch_prefix=str(github_raw.get("branch_prefix", base.github.branch_prefix)),
-                auto_commit=bool(github_raw.get("auto_commit", base.github.auto_commit)),
-                auto_push=bool(github_raw.get("auto_push", base.github.auto_push)),
-                auto_create_pr=bool(github_raw.get("auto_create_pr", base.github.auto_create_pr)),
-                wait_for_checks=bool(
-                    github_raw.get("wait_for_checks", base.github.wait_for_checks)
-                ),
-                check_timeout_seconds=int(
-                    github_raw.get("check_timeout_seconds", base.github.check_timeout_seconds)
-                ),
-                check_poll_seconds=int(
-                    github_raw.get("check_poll_seconds", base.github.check_poll_seconds)
-                ),
-            ),
+            schema_version=schema_version,
+            limits=merged_limits,
+            harness=harness,
+            policy=policy,
+            github=github,
         )
 
 
@@ -304,7 +306,7 @@ def _merge_harness(base: dict[str, HarnessConfig], data: Any) -> dict[str, Harne
             not isinstance(arg, str) for arg in extra_args
         ):
             raise ConfigError(f"[harness.{name}] extra_args must be a list of strings")
-        rejected = sorted(set(extra_args) & FORBIDDEN_EXTRA_ARGS)
+        rejected = extra_arg_violations(extra_args)
         if rejected:
             raise ConfigError(
                 f"[harness.{name}] extra_args contains host-controlled option(s) "
@@ -339,6 +341,9 @@ def _merge_limits(base: LimitsConfig, data: Any) -> LimitsConfig:
         max_rounds=positive_int("max_rounds", base.max_rounds, 1),
         same_failure_limit=positive_int("same_failure_limit", base.same_failure_limit, 1),
         idle_timeout_seconds=positive_int("idle_timeout_seconds", base.idle_timeout_seconds, 1),
+        max_execution_seconds=positive_int(
+            "max_execution_seconds", base.max_execution_seconds, 1
+        ),
     )
 
 

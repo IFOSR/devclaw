@@ -134,6 +134,18 @@ def detect_test_commands(root: Path) -> list[str]:
     return commands
 
 
+def git_invariant(project_root: Path) -> tuple[str | None, str | None]:
+    """(HEAD, branch) as an invariant guard; (None, None) outside git."""
+    root = Path(project_root)
+    if not _is_git_repo(root):
+        return (None, None)
+    code, output = _git(root, "rev-parse", "HEAD", "--abbrev-ref")
+    if code != 0:
+        return (None, None)
+    head, _, branch = output.strip().partition("\n")
+    return (head or None, branch or None)
+
+
 def workspace_state(project_root: Path) -> dict[str, str]:
     """Ground-truth workspace state as ``path -> content hash``.
 

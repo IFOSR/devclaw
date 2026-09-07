@@ -98,14 +98,26 @@ are rejected at load time), and Codex harnesses always run with the
 ## Trust and safety model
 
 - **Host-executed checks**: after every tester round the host itself runs the
-  project's detected test commands and records them in `host-checks.json`.
-  The deterministic gate fails on host failures and on tester reports that
-  contradict them — a harness claiming success cannot pass the gate.
+  project's detected test commands — re-detected every round so tests added
+  mid-run are executed — and records them in `host-checks.json`. The
+  deterministic gate fails only on required project test commands (either
+  host- or tester-executed); diagnostic commands like `git diff --no-index`
+  exiting non-zero are evidence, not failures. A tester claiming success on
+  a host-failed command is rejected.
+- **Stage write guards**: each harness may only write its payload files, the
+  transcripts, and (for the coder) planner-allowed product paths. The
+  planner/tester touching product files, or anyone touching
+  `.metacoding/config.toml`, run evidence, or contract documents is blocked
+  with evidence. Harnesses that commit, merge, or switch branches (changing
+  HEAD or the branch) are blocked too — git history is host-owned.
+- **Total time limit**: `limits.max_execution_seconds` caps each harness
+  invocation on top of the idle-output timeout.
 - **Host-protected paths**: `.git/**`, `.metacoding/config.toml`,
   `.metacoding/state.json`, and `.metacoding/active-run.lock` are protected
   by the host itself, even when a planner allows `**`.
-- **Tester write scope**: during its stage the tester may only write inside
-  `.metacoding/runs/<run-id>/` and `docs/metacoding/TEST_REPORT.md`.
+- **Tester write scope**: during its stage the tester may only write its own
+  round payload files, the transcripts, and `docs/metacoding/TEST_REPORT.md`
+  — never `run.json`, the plan, earlier rounds, or the git evidence.
 - **Owned diff delivery**: the delivery staging set is computed from a
   content-hash baseline captured at run start. Files that were already dirty
   before the run ("mixed" files), files outside the allowed scope, and files
@@ -154,10 +166,13 @@ deliver on a dedicated `metacoding/<run-id>` branch:
   (files mixing your edits with run edits are excluded and reported)
 - no force-push, no rewriting of existing commits, never the default branch
 - push / Pull Request / check waiting require explicit `[github]` opt-in
-- required checks are polled until settled; failed checks (with
-  `wait_for_checks = true`) send the run back to tester evidence and planner
-  review once — a second failure requires human review instead of silently
-  marking the run delivered
+- required checks are read via `gh pr checks --required --json` (names with
+  spaces and cancelled checks handled) and polled until settled; failed
+  checks (with `wait_for_checks = true`) send the run back to tester evidence
+  and planner review once — a second failure requires human review instead of
+  silently marking the run delivered
+- the completed `FINAL_REPORT.md` is committed to the delivery branch so the
+  PR body link always resolves
 
 ## Development
 

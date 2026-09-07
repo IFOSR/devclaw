@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -75,6 +76,12 @@ def apply_step_to_project(project_root: Path, step: dict) -> None:
         target = Path(project_root) / relative_path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(str(content), encoding="utf-8")
+    if step.get("behavior") == "git_commit":
+        # Simulate a harness performing forbidden git operations.
+        for args in (["git", "init", "-q"], ["git", "add", "-A"],
+                     ["git", "-c", "user.email=t@e.st", "-c", "user.name=T",
+                      "commit", "-q", "-m", "harness commit"]):
+            subprocess.run(args, cwd=str(project_root), capture_output=True)
 
 
 def run_subprocess_main(argv: list[str] | None = None) -> int:

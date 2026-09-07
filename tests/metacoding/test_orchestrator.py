@@ -691,3 +691,70 @@ def write_lock_for(root, *, run_id, pid):
         ),
         encoding="utf-8",
     )
+
+
+# --- stage write and git invariants -------------------------------------------------
+
+
+def test_planner_writing_product_files_is_blocked(tmp_path: Path) -> None:
+    hostile_plan = dict(plan_payload())
+    scenario_script = {
+        "attempts": {
+            "plan": [{"files": {"src/planner-write.py": "pwned\n"}, "payload": hostile_plan}],
+            "code": [code_payload()],
+            "test": [make_test_step()],
+            "review": [review_payload()],
+        }
+    }
+    orchestrator, _ = make_orchestrator(tmp_path, scenario_script)
+    result = orchestrator.start("add audit logging")
+    assert result.status is RunStatus.BLOCKED
+    assert "permitted scope" in result.final.reason
+    assert "src/planner-write.py" in result.final.reason
+    # coding never started
+    assert not list((tmp_path / ".metacoding" / "runs" / result.run_id / "rounds").glob("round-*"))
+
+
+def test_coder_touching_metacoding_config_is_blocked(tmp_path: Path) -> None:
+    scenario_script = scenario(
+        code=[code_payload(files={".metacoding/config.toml": "# hijacked\n"})]
+    )
+    orchestrator, _ = make_orchestrator(tmp_path, scenario_script)
+    result = orchestrator.start("add audit logging")
+    assert result.status is RunStatus.BLOCKED
+    assert ".metacoding/config.toml" in result.final.reason
+
+
+def test_tester_tampering_contract_docs_is_blocked(tmp_path: Path) -> None:
+    scenario_script = scenario(
+        test=[make_test_step(files={"docs/metacoding/PRD.md": "# rewritten by tester\n"})]
+    )
+    orchestrator, _ = make_orchestrator(tmp_path, scenario_script)
+    result = orchestrator.start("add audit logging")
+    assert result.status is RunStatus.BLOCKED
+    assert "docs/metacoding/PRD.md" in result.final.reason
+
+
+def test_harness_git_commit_is_blocked(tmp_path: Path) -> None:
+    import subprocess as sp
+
+    sp.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
+    sp.run(["git", "-C", str(tmp_path), "config", "user.email", "t@e.st"], check=True)
+    sp.run(["git", "-C", str(tmp_path), "config", "user.name", "T"], check=True)
+    (tmp_path / "README.md").write_text("base\n", encoding="utf-8")
+    sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    sp.run(["git", "-C", str(tmp_path), "commit", "-q", "-m", "init"], check=True)
+
+    scenario_script = scenario(
+        code=[
+            {
+                "behavior": "git_commit",
+                "files": {"src/audit.py": "log()\n"},
+                "payload": code_payload()["payload"] if "payload" in code_payload() else code_payload(),
+            }
+        ],
+    )
+    orchestrator, _ = make_orchestrator(tmp_path, scenario_script)
+    result = orchestrator.start("add audit logging")
+    assert result.status is RunStatus.BLOCKED
+    assert "git state" in result.final.reason

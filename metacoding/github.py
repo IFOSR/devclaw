@@ -101,6 +101,8 @@ class GhClient:
         "failure": "FAILURE",
         "failed": "FAILURE",
         "pending": "PENDING",
+        "cancel": "CANCELLED",
+        "cancelled": "CANCELLED",
         "skipping": "SKIPPED",
         "skipped": "SKIPPED",
     }
@@ -158,20 +160,42 @@ class GhClient:
     def checks(self, remote: str, branch: str) -> list[dict]:
         """Required-check states for the branch's pull request.
 
-        ``gh pr checks`` exits 8 for failed checks and non-zero while
-        pending; the text output is still parsed in those cases. An exit
-        code of 1 with no check rows means the PR or checks do not exist.
+        Prefers ``gh pr checks <branch> --required --json bucket,name,state``
+        so names containing spaces and the cancel bucket are handled. Falls
+        back to parsing the legacy text output. Non-zero exit codes are data
+        (failed/pending checks), not errors; only missing output is.
         """
-        result = self._run("pr", "checks", branch, check=False)
-        if not result.stdout.strip():
-            if result.returncode != 0:
+        result = self._run(
+            "pr", "checks", branch, "--required", "--json", "bucket,name,state",
+            check=False,
+        )
+        if result.stdout.strip():
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, list):
+                checks: list[dict] = []
+                for item in payload:
+                    if not isinstance(item, dict):
+                        continue
+                    raw = str(item.get("state") or item.get("bucket") or "").lower()
+                    state = self.CHECK_STATE_ALIASES.get(raw)
+                    if state is None:
+                        continue
+                    checks.append({"name": str(item.get("name", "")), "state": state})
+                return checks
+        # Legacy text output fallback.
+        text_result = self._run("pr", "checks", branch, check=False)
+        if not text_result.stdout.strip():
+            if text_result.returncode != 0:
                 raise GitDeliveryError(
                     f"gh pr checks {branch} failed: "
-                    f"{result.stderr.strip() or result.returncode}"
+                    f"{text_result.stderr.strip() or text_result.returncode}"
                 )
             return []
-        checks: list[dict] = []
-        for line in result.stdout.splitlines():
+        checks = []
+        for line in text_result.stdout.splitlines():
             parts = line.split()
             if len(parts) < 2:
                 continue

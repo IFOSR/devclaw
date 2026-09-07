@@ -141,7 +141,35 @@ def test_severity_gate_blocks_p0_and_p1() -> None:
 
 def test_deterministic_checks_gate_requires_passing_commands() -> None:
     assert deterministic_checks_gate(make_report()).passed
-    assert not deterministic_checks_gate(make_report(command_exit=1)).passed
+    required = ["python3 -m pytest -q"]
+    assert not deterministic_checks_gate(
+        make_report(command_exit=1), required_commands=required
+    ).passed
+    # diagnostic commands (e.g. git diff --no-index) exiting non-zero are
+    # evidence, not gate failures
+    diagnostic = make_report()
+    diagnostic = validate_tester_report(
+        {
+            "status": "pass",
+            "test_commands": [
+                {
+                    "command": "git diff --no-index a b",
+                    "exit_code": 1,
+                    "summary": "differences found",
+                }
+            ],
+            "acceptance_results": [
+                {"id": "F-001", "status": "pass", "impact": "high", "evidence": ["t"]},
+                {"id": "F-002", "status": "pass", "impact": "low", "evidence": ["docs"]},
+            ],
+            "findings": [],
+            "prd_drift": [],
+            "regression_risks": [],
+            "missing_tests": [],
+            "changed_files": [],
+        }
+    )
+    assert deterministic_checks_gate(diagnostic, required_commands=required).passed
 
 
 def test_blocking_acceptance_gate() -> None:
@@ -197,7 +225,12 @@ def test_evaluate_acceptance_combines_all_gates() -> None:
     assert all(gate.passed for gate in good)
 
     bad_report = make_report(failing=["F-001"], findings=[finding("P1")], command_exit=1)
-    gates = evaluate_acceptance(PLAN, bad_report, ["evil/out.py"])
+    gates = evaluate_acceptance(
+        PLAN,
+        bad_report,
+        ["evil/out.py"],
+        required_commands=["python3 -m pytest -q"],
+    )
     names = {gate.name: gate.passed for gate in gates}
     assert names["severity"] is False
     assert names["deterministic_checks"] is False

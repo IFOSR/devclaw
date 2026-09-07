@@ -500,29 +500,31 @@ def test_mixed_preexisting_dirty_file_is_never_committed(tmp_path: Path) -> None
     root = _git_project(
         tmp_path,
         default_attempts(
-            # the coder edits a file that was already dirty before the run
-            code=[code_step(files={"src/audit.py": "def log(): pass\n",
-                                   "user-notes.txt": "user edits + coder edits\n"})],
+            # the coder edits src/audit.py, which the user had already dirtied
+            code=[code_step(files={"src/audit.py": "def log(): pass\n"})],
         ),
         github={"enabled": True, "auto_push": False, "auto_create_pr": False},
     )
-    # make user-notes.txt dirty BEFORE the run starts
-    (root / "user-notes.txt").write_text("user's own work\n", encoding="utf-8")
+    # make src/audit.py dirty with the user's own edits BEFORE the run
+    (root / "src").mkdir(exist_ok=True)
+    (root / "src" / "audit.py").write_text("user's own WIP\n", encoding="utf-8")
     result = MetaCodingService(project_root=root).run("add audit logging")
     assert result.exit_code == EXIT_OK
     run_dir = next((root / ".metacoding" / "runs").iterdir())
     delivery = json.loads((run_dir / "git" / "delivery.json").read_text("utf-8"))
-    assert "user-notes.txt" not in delivery["committed_files"]
-    assert "src/audit.py" in delivery["committed_files"]
+    # coder edits and user edits are inseparable -> never staged
+    assert "src/audit.py" not in delivery["committed_files"]
     assert any("mixed" in warning.lower() for warning in delivery["warnings"])
     listed = subprocess.run(
         ["git", "-C", str(root), "ls-tree", "-r", "--name-only", delivery["branch"]],
         capture_output=True, text=True, check=True,
     ).stdout
-    assert "user-notes.txt" not in listed
+    assert "src/audit.py" not in listed
+    # the working tree still carries the merged content
+    assert "def log(): pass" in (root / "src" / "audit.py").read_text("utf-8")
 
 
-def test_out_of_scope_round1_file_is_not_delivered_after_clean_round2(tmp_path: Path) -> None:
+def test_out_of_scope_write_is_blocked_at_stage_time(tmp_path: Path) -> None:
     root = _git_project(
         tmp_path,
         default_attempts(
@@ -537,13 +539,90 @@ def test_out_of_scope_round1_file_is_not_delivered_after_clean_round2(tmp_path: 
         max_rounds=3,
     )
     result = MetaCodingService(project_root=root).run("add audit logging")
-    assert result.exit_code == EXIT_OK
+    # the stage write guard blocks the coder immediately; nothing is delivered
+    assert result.exit_code == EXIT_RUN_REJECTED
+    run_dir = next((root / ".metacoding" / "runs").iterdir())
+    final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+    assert final["outcome"] == "blocked"
+    assert "permitted scope" in final["reason"]
+    assert "outside/scope.py" in final["reason"]
+    branches = subprocess.run(
+        ["git", "-C", str(root), "branch", "--list", "metacoding/*"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert branches.strip() == ""
+
+
+# --- manual deliver follows the same owned-diff rules ---------------------------------
+
+
+def test_manual_deliver_applies_owned_diff_rules(tmp_path: Path) -> None:
+    root = _git_project(
+        tmp_path,
+        default_attempts(code=[code_step(files={"src/audit.py": "def log(): pass\n"})]),
+    )
+    # pre-dirty the file the coder will edit: manual delivery must exclude it
+    (root / "src").mkdir(exist_ok=True)
+    (root / "src" / "audit.py").write_text("user WIP\n", encoding="utf-8")
+
+    service = MetaCodingService(project_root=root)
+    result = service.run("add audit logging")
+    assert result.exit_code == EXIT_OK  # delivered locally, github disabled
+
+    delivered = service.deliver()
+    assert delivered.exit_code == EXIT_OK
     run_dir = next((root / ".metacoding" / "runs").iterdir())
     delivery = json.loads((run_dir / "git" / "delivery.json").read_text("utf-8"))
-    assert "outside/scope.py" not in delivery["committed_files"]
-    assert "src/audit.py" in delivery["committed_files"]
+    assert "src/audit.py" not in delivery["committed_files"]
+    assert any("mixed" in w.lower() for w in delivery["warnings"])
     listed = subprocess.run(
         ["git", "-C", str(root), "ls-tree", "-r", "--name-only", delivery["branch"]],
         capture_output=True, text=True, check=True,
     ).stdout
-    assert "outside/scope.py" not in listed
+    assert "src/audit.py" not in listed
+
+
+def test_host_check_runs_tests_added_by_coder_mid_run(tmp_path: Path) -> None:
+    # No tests exist at run start; the coder adds a FAILING test in round 1.
+    # The host must re-detect and execute it instead of trusting the tester.
+    root = make_project(
+        tmp_path,
+        default_attempts(
+            code=[
+                code_step(files={"src/audit.py": "def log(): pass\n",
+                                 "tests/test_audit.py": "def test_audit():\n    assert False\n"}),
+                code_step(files={"src/audit.py": "def log(): pass\n",
+                                 "tests/test_audit.py": "def test_audit():\n    assert True\n"}),
+            ],
+            review=[review_step("accept"), review_step("accept")],
+        ),
+        max_rounds=3,
+    )
+    result = MetaCodingService(project_root=root).run("add audit logging")
+    assert result.exit_code == EXIT_OK
+    run_dir = next((root / ".metacoding" / "runs").iterdir())
+    round_one_checks = json.loads(
+        (run_dir / "rounds" / "round-001" / "host-checks.json").read_text("utf-8")
+    )
+    assert round_one_checks["checks"], "host must execute tests added mid-run"
+    assert round_one_checks["checks"][0]["exit_code"] != 0
+    final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+    assert final["rounds_used"] == 2
+
+
+def test_final_report_is_committed_to_delivery_branch(tmp_path: Path) -> None:
+    root = _git_project(
+        tmp_path,
+        default_attempts(),
+        github={"enabled": True, "auto_push": False, "auto_create_pr": False},
+    )
+    result = MetaCodingService(project_root=root).run("add audit logging")
+    assert result.exit_code == EXIT_OK
+    run_dir = next((root / ".metacoding" / "runs").iterdir())
+    delivery = json.loads((run_dir / "git" / "delivery.json").read_text("utf-8"))
+    listed = subprocess.run(
+        ["git", "-C", str(root), "ls-tree", "-r", "--name-only", delivery["branch"]],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "docs/metacoding/FINAL_REPORT.md" in listed
+    assert delivery.get("final_report", {}).get("committed") is True

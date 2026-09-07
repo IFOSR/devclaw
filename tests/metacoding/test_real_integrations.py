@@ -118,6 +118,26 @@ def test_real_pi_coder_implements_plan(tmp_path: Path) -> None:
 @pytest.mark.skipif(not HAVE_CODEX, reason="codex CLI not installed")
 def test_real_codex_tester_reports_on_implementation(tmp_path: Path) -> None:
     (tmp_path / "hello.txt").write_text("hi\n", encoding="utf-8")
+    # The tester prompt points at the contract documents: provide them so a
+    # real run has the same context the orchestrator would render.
+    docs = tmp_path / "docs" / "metacoding"
+    docs.mkdir(parents=True, exist_ok=True)
+    (docs / "PRD.md").write_text(
+        "# PRD\n\nCreate hello.txt containing exactly: hi\n", encoding="utf-8"
+    )
+    (docs / "ARCHITECTURE.md").write_text("# Architecture\n\nsingle file\n", encoding="utf-8")
+    (docs / "IMPLEMENTATION_PLAN.md").write_text(
+        "# Implementation Plan\n\n- TASK-001: create hello.txt\n", encoding="utf-8"
+    )
+    (docs / "ACCEPTANCE.md").write_text(
+        "# Acceptance Criteria\n\n- F-001: hello.txt contains exactly hi\n",
+        encoding="utf-8",
+    )
+    transcripts: list[tuple[str, object]] = []
+
+    def sink(stage: str, result) -> None:
+        transcripts.append((stage, result))
+
     model = os.environ.get("METACODING_TESTER_MODEL", "")
     tester = CodexTester(
         HarnessConfig("tester", "codex", "codex", model, []), tmp_path
@@ -125,9 +145,12 @@ def test_real_codex_tester_reports_on_implementation(tmp_path: Path) -> None:
     ctx = context(tmp_path, tmp_path / ".metacoding" / "real" / "test")
     ctx.report_dir.mkdir(parents=True, exist_ok=True)
     ctx.test_commands = []
+    ctx.transcript_sink = sink
     report = tester.test(ctx)
     assert report.status in ("pass", "fail")
     assert report.acceptance_results
+    # transcripts (incl. stderr on failure) are preserved for diagnosis
+    assert transcripts and transcripts[0][1].stderr is not None
 
 
 @pytest.mark.skipif(not (HAVE_CODEX and HAVE_PI), reason="codex and pi CLIs required")

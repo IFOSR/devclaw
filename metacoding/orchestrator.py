@@ -26,7 +26,7 @@ from metacoding.errors import (
     ProtocolError,
 )
 from metacoding.harnesses.base import Harness, HarnessContext
-from metacoding.locking import acquire_lock, project_lock, release_lock, update_lock_run_id
+from metacoding.locking import acquire_lock
 from metacoding.models import (
     FinalReport,
     PlannerPlan,
@@ -45,10 +45,17 @@ from metacoding.policies import (
     protected_path_gate,
     repeated_failure_reached,
     scope_gate,
+    write_scope_gate,
 )
 from metacoding.persistence import RunStore, ResumePlan, atomic_write_json, resolve_resume
 from metacoding.process_runner import ProcessRunner
-from metacoding.project import capture_snapshot, workspace_state, detect_workspace_changes
+from metacoding.project import (
+    capture_snapshot,
+    detect_test_commands,
+    detect_workspace_changes,
+    git_invariant,
+    workspace_state,
+)
 
 EXIT_BY_STATUS = {
     RunStatus.DELIVERED: 0,
@@ -64,6 +71,14 @@ RETRYABLE_ERRORS = (MalformedHarnessOutput, ProtocolError, HarnessTimeout, Harne
 
 class InfrastructureFailure(MetaCodingError):
     """A harness could not be invoked successfully twice in a row."""
+
+
+class StageViolation(MetaCodingError):
+    """A harness violated its stage write or git invariants.
+
+    Raised by the stage guards and converted into a blocked final state by
+    :meth:`Orchestrator._execute`.
+    """
 
 
 @dataclass
@@ -122,11 +137,11 @@ class Orchestrator:
             )
         # Acquire the lock BEFORE creating any run record so a lock failure
         # never leaves an orphaned active-run pointer behind.
-        acquire_lock(self.project_root, f"pending-{os.getpid()}")
+        handle = acquire_lock(self.project_root, f"pending-{os.getpid()}")
         try:
             baseline = capture_snapshot(self.project_root)
             record = self.store.create_run(requirement, self.config, baseline)
-            update_lock_run_id(self.project_root, record.run_id)
+            handle.retarget(record.run_id)
             self.store.save_git_artifact(
                 record.run_id,
                 "baseline",
@@ -139,12 +154,12 @@ class Orchestrator:
                 },
             )
         except BaseException:
-            release_lock(self.project_root)
+            handle.release()
             raise
         try:
             return self._execute(record)
         finally:
-            release_lock(self.project_root)
+            handle.release()
 
     def resume(self) -> OrchestratorResult:
         plan = resolve_resume(self.store)
@@ -154,8 +169,11 @@ class Orchestrator:
             raise MetaCodingError(f"run {plan.run_id} already finished and cannot be resumed")
         record = self.store.load_run(plan.run_id)
         self._info(f"resuming run {record.run_id} from state {record.status.value}")
-        with project_lock(self.project_root, record.run_id):
+        handle = acquire_lock(self.project_root, record.run_id)
+        try:
             return self._execute(record)
+        finally:
+            handle.release()
 
     def cancel(self) -> OrchestratorResult:
         state = self.store.read_state()
@@ -165,7 +183,7 @@ class Orchestrator:
         # A live lock holder means the run is executing somewhere else:
         # refuse to clean up state underneath a running harness.
         try:
-            acquire_lock(self.project_root, record.run_id)
+            handle = acquire_lock(self.project_root, record.run_id)
         except MetaCodingError as exc:
             raise MetaCodingError(
                 f"cannot cancel: {exc} Stop that process first, then cancel."
@@ -178,7 +196,7 @@ class Orchestrator:
                 "The run was cancelled; all evidence is preserved.",
             )
         finally:
-            release_lock(self.project_root)
+            handle.release()
 
     # --- main loop ---------------------------------------------------------------
 
@@ -205,6 +223,14 @@ class Orchestrator:
                 RunStatus.FAILED_INFRASTRUCTURE,
                 str(exc),
                 "The harness infrastructure failed before the product could be judged.",
+            )
+        except StageViolation as exc:
+            return self._finalize(
+                record,
+                RunStatus.BLOCKED,
+                str(exc),
+                "A harness violated the deterministic write or git invariants; "
+                "all evidence is preserved.",
             )
         except GitDeliveryError as exc:
             # Delivery is host-owned; a git safety failure needs an operator.
@@ -272,6 +298,46 @@ class Orchestrator:
 
     # --- stages -------------------------------------------------------------------
 
+    def _guard_stage_writes(
+        self,
+        record: RunRecord,
+        harness_label: str,
+        pre_state: dict[str, str],
+        pre_git: tuple[str | None, str | None],
+        *,
+        stage_payload_files: set[str],
+        stage_prefixes: tuple[str, ...],
+        allowed_patterns: tuple[str, ...],
+    ) -> None:
+        """Enforce per-stage write and git invariants after a harness ran.
+
+        Raises :class:`StageViolation` when the harness wrote outside its
+        permitted scope or performed git operations. Git history and the
+        branch may only be changed by the host's delivery stage.
+        """
+        post_git = git_invariant(self.project_root)
+        if post_git != pre_git:
+            raise StageViolation(
+                f"{harness_label} changed git state during its stage "
+                f"(head/branch {pre_git} -> {post_git}); harnesses must not "
+                f"commit, merge, or switch branches"
+            )
+        post_state = workspace_state(self.project_root)
+        raw_changes = detect_workspace_changes(
+            pre_state, post_state, ignore_prefixes=()
+        )
+        gate = write_scope_gate(
+            raw_changes,
+            allowed_files=set(stage_payload_files),
+            allowed_prefixes=stage_prefixes,
+            allowed_patterns=allowed_patterns,
+        )
+        if not gate.passed:
+            raise StageViolation(
+                f"{harness_label} wrote outside its permitted scope: "
+                f"{', '.join(gate.details)}"
+            )
+
     def _ensure_plan(self, record: RunRecord, force: bool = False) -> PlannerPlan:
         existing = self.store.load_plan(record.run_id)
         if existing is not None and not force and record.status is not RunStatus.PLANNING:
@@ -280,12 +346,26 @@ class Orchestrator:
             return existing
         self._phase("planning", "Planner is analyzing the project and requirement.")
         report_dir = self.store.run_dir(record.run_id)
+        pre_state = workspace_state(self.project_root)
+        pre_git = git_invariant(self.project_root)
         plan = self._invoke(
             "planner",
             "plan",
             record,
             lambda ctx: self.harnesses["planner"].plan(ctx),
             report_dir=report_dir,
+        )
+        self._guard_stage_writes(
+            record,
+            "planner",
+            pre_state,
+            pre_git,
+            stage_payload_files={
+                f".metacoding/runs/{record.run_id}/plan-payload.json",
+                f".metacoding/runs/{record.run_id}/plan-payload.last-message",
+            },
+            stage_prefixes=(f".metacoding/runs/{record.run_id}/transcripts/",),
+            allowed_patterns=(),
         )
         self.store.save_plan(record.run_id, plan)
         self._render_contract_docs(record.run_id, record.requirement, plan)
@@ -329,6 +409,7 @@ class Orchestrator:
 
         round_dir = self.store.round_dir(record.run_id, round_number)
         pre_state = workspace_state(self.project_root)
+        pre_git = git_invariant(self.project_root)
         coding = self._invoke(
             "coder",
             "code",
@@ -336,6 +417,21 @@ class Orchestrator:
             lambda ctx: self.harnesses["coder"].code(ctx),
             report_dir=round_dir,
             extra={"plan": plan, "rework_tasks": tasks if round_number > 1 else []},
+        )
+        # Per-stage write guard: the coder may only touch its payload files,
+        # transcripts, and planner-allowed product paths (never host
+        # protected paths such as .metacoding/config.toml).
+        self._guard_stage_writes(
+            record,
+            "coder",
+            pre_state,
+            pre_git,
+            stage_payload_files={
+                f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/code-payload.json",
+                f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/code-payload.last-message",
+            },
+            stage_prefixes=(f".metacoding/runs/{record.run_id}/transcripts/",),
+            allowed_patterns=tuple(plan.change_policy.allowed_paths),
         )
         post_state = workspace_state(self.project_root)
         changed = sorted(detect_workspace_changes(pre_state, post_state))
@@ -400,6 +496,7 @@ class Orchestrator:
         self._phase("testing", "Tester is running review and acceptance checks.")
         round_dir = self.store.round_dir(record.run_id, round_number)
         pre_state = workspace_state(self.project_root)
+        pre_git = git_invariant(self.project_root)
         report = self._invoke(
             "tester",
             "test",
@@ -409,20 +506,37 @@ class Orchestrator:
             extra={
                 "plan": plan,
                 "changed_files": round_record.changed_files,
-                "test_commands": record.baseline.test_commands,
+                "test_commands": detect_test_commands(self.project_root),
             },
         )
         post_state = workspace_state(self.project_root)
+        post_git = git_invariant(self.project_root)
+        if post_git != pre_git:
+            raise StageViolation(
+                f"tester changed git state during its stage "
+                f"(head/branch {pre_git} -> {post_git}); harnesses must not "
+                f"commit, merge, or switch branches"
+            )
         round_record.tester_report = report
         self.store.save_round(record.run_id, round_record)
         self._render_test_report(record.run_id, report, round_number)
 
+        # The tester may only write its own payload files, the transcripts,
+        # and TEST_REPORT.md — never run.json, the plan, earlier rounds, or
+        # the git/ evidence directory.
         contamination = contamination_gate(
             pre_state,
             post_state,
             tester_can_modify_source=self.config.policy.tester_can_modify_source,
-            # The tester may only write its own run directory and report.
-            allowed_prefixes=(f".metacoding/runs/{record.run_id}/",),
+            allowed_prefixes=(
+                f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/",
+                f".metacoding/runs/{record.run_id}/transcripts/",
+            ),
+            allowed_files=(
+                f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/test-payload.json",
+                f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/test-payload.last-message",
+                "docs/metacoding/TEST_REPORT.md",
+            ),
         )
         if not contamination.passed:
             stop = self._finalize(
@@ -450,16 +564,23 @@ class Orchestrator:
         return _RoundOutcome(round_record)
 
     def _run_host_checks(self, record: RunRecord, round_number: int) -> list[dict]:
-        """Execute the project's detected test commands host-side."""
+        """Execute the project's test commands host-side.
+
+        Commands are re-detected every round so tests added by the coder in
+        this or earlier rounds are executed, not only the ones that existed
+        when the run started.
+        """
+        commands = detect_test_commands(self.project_root)
         results: list[dict] = []
         runner = ProcessRunner()
-        for command_text in record.baseline.test_commands:
+        for command_text in commands:
             command = shlex.split(command_text)
             try:
                 result = runner.run(
                     command,
                     cwd=self.project_root,
                     idle_timeout_seconds=self.config.limits.idle_timeout_seconds,
+                    max_execution_seconds=self.config.limits.max_execution_seconds,
                 )
             except HarnessCommandMissing as exc:
                 results.append(
@@ -496,6 +617,8 @@ class Orchestrator:
             raise MetaCodingError(f"round {round_number} has no tester report to review")
         self._phase("planner_review", f"Planner is reviewing round {round_number} evidence.")
         round_dir = self.store.round_dir(record.run_id, round_number)
+        pre_state = workspace_state(self.project_root)
+        pre_git = git_invariant(self.project_root)
         decision = self._invoke(
             "planner",
             "review",
@@ -508,6 +631,18 @@ class Orchestrator:
                 "changed_files": round_record.changed_files,
                 "host_checks": round_record.host_checks,
             },
+        )
+        self._guard_stage_writes(
+            record,
+            "planner review",
+            pre_state,
+            pre_git,
+            stage_payload_files={
+                f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/review-payload.json",
+                f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/review-payload.last-message",
+            },
+            stage_prefixes=(f".metacoding/runs/{record.run_id}/transcripts/",),
+            allowed_patterns=(),
         )
         round_record.planner_decision = decision
         self.store.save_round(record.run_id, round_record)
@@ -550,6 +685,9 @@ class Orchestrator:
                 round_record.tester_report,
                 round_record.changed_files,
                 host_checks=round_record.host_checks,
+                required_commands=[
+                    check["command"] for check in round_record.host_checks
+                ],
             )
             failed = [gate for gate in gates if not gate.passed]
             if not failed:
@@ -612,6 +750,7 @@ class Orchestrator:
             round_record.tester_report,
             round_record.changed_files,
             host_checks=round_record.host_checks,
+            required_commands=[check["command"] for check in round_record.host_checks],
         )
         failed = [gate for gate in gates if not gate.passed]
         if failed:
@@ -629,55 +768,7 @@ class Orchestrator:
         return delivered
 
     def _owned_delivery_files(self, record: RunRecord, plan: PlannerPlan) -> tuple[list[str], list[str]]:
-        """Compute the run's deliverable files against the persisted baseline.
-
-        Returns ``(deliverable, warnings)``. Files that were already dirty
-        before the run and were edited again cannot be separated from the
-        user's own edits, so they are never staged automatically. Files
-        outside the planner's allowed scope are excluded as well. Planner-
-        protected contract documents are only deliverable when their content
-        still matches what the host rendered (no harness tampering).
-        """
-        baseline_artifact = self.store.load_git_artifact(record.run_id, "baseline") or {}
-        baseline_state = baseline_artifact.get("workspace_state") or {}
-        current_state = workspace_state(self.project_root)
-        changed = detect_workspace_changes(baseline_state, current_state)
-        contract_hashes = (
-            self.store.load_git_artifact(record.run_id, "contract-hashes") or {}
-        )
-        baseline_dirty = set(record.baseline.dirty_files)
-        mixed = sorted(path for path in changed if path in baseline_dirty)
-
-        def deliverable(path: str) -> bool:
-            if is_host_protected(path):
-                return False
-            if any(path_matches(path, pattern) for pattern in plan.change_policy.allowed_paths):
-                return True
-            # Not in allowed scope: still fine when it is a host-rendered
-            # contract document with unmodified content.
-            return (
-                path in contract_hashes
-                and current_state.get(path) == contract_hashes.get(path)
-            )
-
-        deliverable_files = sorted(
-            path
-            for path in changed - set(mixed)
-            if deliverable(path)
-            and not any(
-                path_matches(path, pattern)
-                for pattern in plan.change_policy.protected_paths
-                if not (
-                    path in contract_hashes
-                    and current_state.get(path) == contract_hashes.get(path)
-                )
-            )
-        )
-        excluded = sorted((changed - set(mixed)) - set(deliverable_files))
-        warnings = [
-            f"not staged (mixed with pre-existing user edits): {path}" for path in mixed
-        ] + [f"not staged (outside the allowed scope): {path}" for path in excluded]
-        return deliverable_files, warnings
+        return compute_owned_delivery_files(self.project_root, self.store, record, plan)
 
     def _record_contract_hashes(self, run_id: str, updates: dict[str, str]) -> None:
         artifact = self.store.load_git_artifact(run_id, "contract-hashes") or {}
@@ -689,7 +780,21 @@ class Orchestrator:
     ) -> OrchestratorResult:
         record.status = RunStatus.ACCEPTED
         self.store.save_run(record, active_status=RunStatus.ACCEPTED)
-        owned, ownership_warnings = self._owned_delivery_files(record, plan)
+        # Render FINAL_REPORT.md (github section pending) BEFORE computing the
+        # owned diff so the delivery branch commit includes the final report
+        # the PR body points at.
+        preliminary = self._build_final(
+            record,
+            RunStatus.DELIVERED.value,
+            reason or "planner accepted the implementation",
+            f"All gates passed after {record.current_round} round(s).",
+            [],
+            github=None,
+        )
+        self._render_final_report(preliminary)
+        owned, ownership_warnings = compute_owned_delivery_files(
+            self.project_root, self.store, record, plan
+        )
         for warning in ownership_warnings:
             self._info(f"delivery: {warning}")
         github_result = None
@@ -746,7 +851,7 @@ class Orchestrator:
                 f"known limitation: {item}"
                 for item in round_record.coding_result.known_limitations
             )
-        return self._finalize(
+        result = self._finalize(
             record,
             RunStatus.DELIVERED,
             reason or "planner accepted the implementation",
@@ -754,6 +859,37 @@ class Orchestrator:
             warnings=warnings,
             github=github_result,
         )
+        self._update_final_report_on_branch(record, github_result, warnings)
+        return result
+
+    def _update_final_report_on_branch(
+        self, record: RunRecord, github_result: dict | None, warnings: list[str]
+    ) -> None:
+        """Commit the completed FINAL_REPORT.md to the delivery branch.
+
+        The first commit carries the report with a pending github section;
+        after delivery the real section is rendered and appended as a second
+        commit so the branch always contains the report the PR body links.
+        """
+        if (
+            not github_result
+            or not github_result.get("commit")
+            or self.deliverer is None
+        ):
+            return
+        try:
+            update = self.deliverer.deliver(
+                record.run_id, ["docs/metacoding/FINAL_REPORT.md"]
+            ) or {}
+        except MetaCodingError as exc:
+            warnings.append(f"final report not committed to branch: {exc}")
+            return
+        artifact = self.store.load_git_artifact(record.run_id, "delivery") or {}
+        artifact["final_report"] = {
+            "committed": bool(update.get("commit")),
+            "commit": update.get("commit"),
+        }
+        self.store.save_git_artifact(record.run_id, "delivery", artifact)
 
     # --- harness invocation with retry ----------------------------------------------
 
@@ -774,6 +910,9 @@ class Orchestrator:
             attempt = self._stage_attempts[stage]
             context_fields = dict(extra or {})
             context_fields.setdefault("policy", self.config.policy)
+            context_fields.setdefault(
+                "max_execution_seconds", self.config.limits.max_execution_seconds
+            )
             context = HarnessContext(
                 requirement=record.requirement,
                 run_id=record.run_id,
@@ -986,6 +1125,58 @@ class Orchestrator:
             f"## Rounds used\n\n{final.rounds_used}\n\n## Artifacts\n\n{artifacts}\n\n"
             f"## Warnings\n\n{warnings}\n\n## GitHub\n\n{github}\n",
         )
+
+
+def compute_owned_delivery_files(
+    project_root: Path, store: RunStore, record: RunRecord, plan: PlannerPlan
+) -> tuple[list[str], list[str]]:
+    """Compute the run's deliverable files against the persisted baseline.
+
+    Returns ``(deliverable, warnings)``. Files that were already dirty before
+    the run and were edited again cannot be separated from the user's own
+    edits, so they are never staged automatically. Files outside the
+    planner's allowed scope are excluded as well. Planner-protected contract
+    documents are only deliverable when their content still matches what the
+    host rendered (no harness tampering).
+    """
+    baseline_artifact = store.load_git_artifact(record.run_id, "baseline") or {}
+    baseline_state = baseline_artifact.get("workspace_state") or {}
+    current_state = workspace_state(project_root)
+    changed = detect_workspace_changes(baseline_state, current_state)
+    contract_hashes = store.load_git_artifact(record.run_id, "contract-hashes") or {}
+    baseline_dirty = set(record.baseline.dirty_files)
+    mixed = sorted(path for path in changed if path in baseline_dirty)
+
+    def content_matches_host_render(path: str) -> bool:
+        return (
+            path in contract_hashes
+            and current_state.get(path) == contract_hashes.get(path)
+        )
+
+    def deliverable(path: str) -> bool:
+        if is_host_protected(path):
+            return False
+        if any(path_matches(path, pattern) for pattern in plan.change_policy.allowed_paths):
+            return True
+        # Not in allowed scope: still fine when it is a host-rendered
+        # contract document with unmodified content.
+        return content_matches_host_render(path)
+
+    deliverable_files = sorted(
+        path
+        for path in changed - set(mixed)
+        if deliverable(path)
+        and not any(
+            path_matches(path, pattern)
+            for pattern in plan.change_policy.protected_paths
+            if not content_matches_host_render(path)
+        )
+    )
+    excluded = sorted((changed - set(mixed)) - set(deliverable_files))
+    warnings = [
+        f"not staged (mixed with pre-existing user edits): {path}" for path in mixed
+    ] + [f"not staged (outside the allowed scope): {path}" for path in excluded]
+    return deliverable_files, warnings
 
 
 def _file_digest(path: Path) -> str:

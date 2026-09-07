@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import json
 import pytest
 
 from metacoding.cli import build_parser
@@ -272,5 +273,58 @@ check_poll_seconds = 5
 
 def test_github_check_timing_settings_validated(tmp_path: Path) -> None:
     write_config(tmp_path, "[github]\ncheck_timeout_seconds = 0\n")
+    with pytest.raises(ConfigError):
+        load_config(tmp_path)
+
+
+# --- extra_args hardening: prefixed forms ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "--sandbox=danger-full-access",
+        '--config=sandbox_mode="danger-full-access"',
+        "--add-dir=/",
+        "--add-dir",
+        "--profile=untrusted",
+    ],
+)
+def test_prefixed_dangerous_extra_args_rejected(tmp_path: Path, token: str) -> None:
+    write_config(tmp_path, f'[harness.tester]\nextra_args = ["{token}"]\n')
+    with pytest.raises(ConfigError):
+        load_config(tmp_path)
+
+
+def test_snapshot_validation_rejects_tampered_configs() -> None:
+    from metacoding.config import ProjectConfig
+
+    base = default_config().to_dict()
+    tampered = json.loads(json.dumps(base))
+    tampered["harness"]["planner"]["provider"] = "deepseek"
+    with pytest.raises(ConfigError):
+        ProjectConfig.from_dict(tampered)
+
+    tampered = json.loads(json.dumps(base))
+    tampered["harness"]["coder"]["extra_args"] = ["--sandbox=read-only"]
+    with pytest.raises(ConfigError):
+        ProjectConfig.from_dict(tampered)
+
+    tampered = json.loads(json.dumps(base))
+    tampered["limits"]["max_rounds"] = 0
+    with pytest.raises(ConfigError):
+        ProjectConfig.from_dict(tampered)
+
+    tampered = json.loads(json.dumps(base))
+    tampered["github"]["mode"] = "force-push"
+    with pytest.raises(ConfigError):
+        ProjectConfig.from_dict(tampered)
+
+
+def test_max_execution_seconds_configured_and_validated(tmp_path: Path) -> None:
+    write_config(tmp_path, "[limits]\nmax_execution_seconds = 120\n")
+    config = load_config(tmp_path)
+    assert config.limits.max_execution_seconds == 120
+    write_config(tmp_path, "[limits]\nmax_execution_seconds = 0\n")
     with pytest.raises(ConfigError):
         load_config(tmp_path)

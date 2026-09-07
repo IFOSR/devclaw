@@ -41,6 +41,8 @@ class CommandResult:
     timed_out: bool
     idle_timeout_seconds: float
     truncated: bool = False
+    #: Which limit fired: "", "idle", or "total".
+    limit_reason: str = ""
 
     def metadata(self) -> dict:
         """Serializable command metadata for transcripts."""
@@ -54,6 +56,7 @@ class CommandResult:
             "timed_out": self.timed_out,
             "idle_timeout_seconds": self.idle_timeout_seconds,
             "truncated": self.truncated,
+            "limit_reason": self.limit_reason,
         }
 
 
@@ -101,6 +104,7 @@ class ProcessRunner:
         *,
         cwd: Path,
         idle_timeout_seconds: float = 900.0,
+        max_execution_seconds: float | None = None,
         env: dict[str, str] | None = None,
         on_output: Callable[[str, str], None] | None = None,
         max_stream_bytes: int = MAX_STREAM_BYTES,
@@ -156,12 +160,24 @@ class ProcessRunner:
             thread.start()
 
         timed_out = False
+        limit_reason = ""
+        total_deadline = (
+            time.monotonic() + max_execution_seconds
+            if max_execution_seconds is not None and max_execution_seconds > 0
+            else None
+        )
         try:
             while process.poll() is None:
                 with activity_lock:
                     idle_for = time.monotonic() - last_activity
                 if idle_for > idle_timeout_seconds:
                     timed_out = True
+                    limit_reason = "idle"
+                    self._terminate_group(process)
+                    break
+                if total_deadline is not None and time.monotonic() > total_deadline:
+                    timed_out = True
+                    limit_reason = "total"
                     self._terminate_group(process)
                     break
                 time.sleep(POLL_INTERVAL_SECONDS)
@@ -187,6 +203,7 @@ class ProcessRunner:
             timed_out=timed_out,
             idle_timeout_seconds=idle_timeout_seconds,
             truncated=truncated,
+            limit_reason=limit_reason,
         )
 
     @staticmethod

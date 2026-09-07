@@ -10,6 +10,7 @@ schema_version = 1
 max_rounds = 6
 same_failure_limit = 2
 idle_timeout_seconds = 900
+max_execution_seconds = 3600   # hard wall-clock limit per harness invocation
 
 [harness.planner]
 provider = "codex"

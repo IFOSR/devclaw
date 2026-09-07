@@ -137,3 +137,22 @@ def test_idle_timeout_kills_the_whole_process_tree(tmp_path) -> None:
     time.sleep(0.3)
     with pytest.raises(ProcessLookupError):
         os.kill(grandchild_pid, 0)
+
+
+def test_total_execution_limit_kills_heartbeating_process(tmp_path) -> None:
+    # A process that keeps printing would never trip the idle timeout;
+    # the total limit must still terminate it.
+    started = time.monotonic()
+    result = ProcessRunner().run(
+        [
+            sys.executable,
+            "-c",
+            "import time\nwhile True:\n    print('beat', flush=True)\n    time.sleep(0.05)",
+        ],
+        cwd=tmp_path,
+        idle_timeout_seconds=30,
+        max_execution_seconds=1,
+    )
+    assert result.timed_out is True
+    assert result.limit_reason == "total"
+    assert time.monotonic() - started < 10

@@ -1,13 +1,21 @@
 """Project-level lock ensuring one active MetaCoding run per project.
 
-The lock file ``.metacoding/active-run.lock`` is created atomically and
-stores the owning PID, host, run id, and acquisition time. Locks left by
-processes that are no longer alive are detected as stale; locks held by
-live processes are never overwritten.
+The lock file ``.metacoding/active-run.lock`` is created atomically
+(O_CREAT|O_EXCL) and stores the owning PID, host, run id, and acquisition
+time. Mutations of an existing lock compare-and-swap through ``flock``:
+
+- a live owner holds an exclusive ``flock`` for the whole run, so a
+  concurrent stale-takeover attempt fails the non-blocking ``flock`` and
+  never stomps a freshly created lock;
+- takeover of a lock whose owner is dead happens under the ``flock``, so
+  two racing takeovers cannot both win;
+- release verifies the file still belongs to us before unlinking, so a
+  former owner can never delete a successor's lock.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import socket
@@ -36,25 +44,59 @@ class LockInfo:
         }
 
 
-@dataclass
 class LockHandle:
-    info: LockInfo
-    stale_replaced: bool
-    path: Path
+    """An owned lock: open fd plus exclusive flock for the run's lifetime."""
+
+    def __init__(self, info: LockInfo, path: Path, fd: int, stale_replaced: bool) -> None:
+        self.info = info
+        self.path = path
+        self.fd = fd
+        self.stale_replaced = stale_replaced
+        self._released = False
+
+    def retarget(self, run_id: str) -> None:
+        """Re-label the lock we own with the real run id."""
+        if self._released:
+            raise LockError("cannot retarget a released lock")
+        self.info = LockInfo(
+            run_id=run_id,
+            pid=self.info.pid,
+            host=self.info.host,
+            acquired_at=self.info.acquired_at,
+        )
+        _rewrite_fd(self.fd, self.info)
+
+    def release(self) -> bool:
+        """Unlink the lock if it is still ours; drop the flock either way."""
+        if self._released:
+            return False
+        self._released = True
+        try:
+            current = _read_path(self.path)
+            if current is None or current.pid != self.info.pid or (
+                self.info.run_id and current.run_id != self.info.run_id
+            ):
+                # Someone else owns the file now; never delete their lock.
+                return False
+            self.path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+        finally:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except OSError:  # pragma: no cover - fd already closed
+                pass
+            os.close(self.fd)
 
 
 def lock_path(project_root: Path) -> Path:
     return Path(project_root) / LOCK_FILENAME
 
 
-def read_lock(project_root: Path) -> LockInfo | None:
-    """Return lock metadata, ``None`` when no lock exists.
-
-    A corrupt lock file is reported as :class:`PersistenceError` so callers
-    can decide how to surface it; ``read_lock_or_none`` never hides real
-    corruption silently.
-    """
-    path = lock_path(project_root)
+def _read_path(path: Path) -> LockInfo | None:
     if not path.is_file():
         return None
     try:
@@ -74,6 +116,19 @@ def read_lock(project_root: Path) -> LockInfo | None:
         raise PersistenceError(f"project lock {path} is malformed: {exc}") from exc
 
 
+def read_lock(project_root: Path) -> LockInfo | None:
+    """Return lock metadata, ``None`` when no lock exists."""
+    return _read_path(lock_path(project_root))
+
+
+def _rewrite_fd(fd: int, info: LockInfo) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    payload = json.dumps(info.to_dict(), indent=2) + "\n"
+    os.write(fd, payload.encode("utf-8"))
+    os.fsync(fd)
+
+
 def _process_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -82,17 +137,6 @@ def _process_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
-
-
-def _write_lock(path: Path, info: LockInfo) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f"{path.name}.tmp")
-    with open(temp_path, "w", encoding="utf-8") as handle:
-        json.dump(info.to_dict(), handle, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp_path, path)
 
 
 def acquire_lock(
@@ -110,55 +154,92 @@ def acquire_lock(
     )
 
     try:
-        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
     except FileExistsError:
-        existing = read_lock(root)
-        stale = existing is None or not _process_alive(existing.pid)
+        # Existing lock: mutate only under an exclusive flock (CAS).
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except FileNotFoundError:
+            # Lost a race with a releasing owner: retry creation once.
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _rewrite_fd(fd, info)
+            return LockHandle(info, path, fd, stale_replaced=False)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            current = read_lock(root)
+            _raise_busy(root, path, current, note="another process is locking it")
+        current = read_lock(root)
+        stale = current is None or not _process_alive(current.pid)
         if stale and allow_stale_replacement:
-            _write_lock(path, info)
-            return LockHandle(info=info, stale_replaced=True, path=path)
-        current_host = socket.gethostname()
-        message = (
-            f"a MetaCoding run is already active for this project "
-            f"(run-id: {existing.run_id if existing else 'unknown'}, "
-            f"pid: {existing.pid if existing else '?'}, "
-            f"host: {existing.host if existing else '?'}). "
-            f"If that process has exited, remove {path} or rerun to replace the stale lock."
-        )
-        raise LockError(
-            message,
-            lock_path=str(path),
-            run_id=existing.run_id if existing else "",
-            pid=existing.pid if existing else None,
-            host=existing.host if existing else "",
-        )
-    else:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(info.to_dict(), handle, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        return LockHandle(info=info, stale_replaced=False, path=path)
+            _rewrite_fd(fd, info)
+            return LockHandle(info, path, fd, stale_replaced=True)
+        os.close(fd)
+        _raise_busy(root, path, current)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    _rewrite_fd(fd, info)
+    return LockHandle(info, path, fd, stale_replaced=False)
 
 
-def release_lock(project_root: Path) -> None:
+def _raise_busy(root: Path, path: Path, current: LockInfo | None, note: str = "") -> None:
+    detail = f" ({note})" if note else ""
+    message = (
+        f"a MetaCoding run is already active for this project "
+        f"(run-id: {current.run_id if current else 'unknown'}, "
+        f"pid: {current.pid if current else '?'}, "
+        f"host: {current.host if current else '?'}){detail}. "
+        f"If that process has exited, remove {path} or rerun to replace the stale lock."
+    )
+    raise LockError(
+        message,
+        lock_path=str(path),
+        run_id=current.run_id if current else "",
+        pid=current.pid if current else None,
+        host=current.host if current else "",
+    )
+
+
+def release_lock(
+    project_root: Path,
+    *,
+    expected_pid: int | None = None,
+    expected_run_id: str | None = None,
+) -> bool:
+    """Unlink the lock when it still matches ``expected_*``; never touch a
+    lock owned by someone else."""
     path = lock_path(project_root)
+    current = _read_path(path)
+    if current is None:
+        return False
+    if expected_pid is not None and current.pid != expected_pid:
+        return False
+    if expected_run_id is not None and current.run_id != expected_run_id:
+        return False
     try:
         path.unlink()
-    except FileNotFoundError:
-        pass
+        return True
+    except FileNotFoundError:  # pragma: no cover - racing release
+        return False
 
 
 def update_lock_run_id(project_root: Path, run_id: str) -> None:
-    """Retarget a lock we already own to the real run id.
-
-    Used because the lock is acquired before the run id exists.
-    """
+    """Retarget a lock we already own (legacy helper for direct callers)."""
     path = lock_path(project_root)
     existing = read_lock(project_root)
     if existing is None or existing.pid != os.getpid():
         return
-    _write_lock(path, LockInfo(run_id=run_id, pid=existing.pid, host=existing.host, acquired_at=existing.acquired_at))
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:  # pragma: no cover
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _rewrite_fd(fd, LockInfo(run_id=run_id, pid=existing.pid, host=existing.host,
+                                 acquired_at=existing.acquired_at))
+    finally:
+        os.close(fd)
 
 
 class project_lock:
@@ -174,4 +255,5 @@ class project_lock:
         return self.handle
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        release_lock(self._root)
+        if self.handle is not None:
+            self.handle.release()
