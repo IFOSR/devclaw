@@ -1,0 +1,172 @@
+"""Project inspection: git baseline, file inventory, and test detection.
+
+All path values produced here are POSIX strings relative to the project
+root so persisted records stay portable across machines.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import subprocess
+from typing import Mapping
+from pathlib import Path
+
+from metacoding.models import ProjectSnapshot, now_utc
+
+#: Directories that never belong to a project's business snapshot.
+EXCLUDED_DIR_NAMES = {
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".venv",
+    "venv",
+    "node_modules",
+}
+
+#: Paths under ``.metacoding`` that are runtime-generated state.
+EXCLUDED_METACODING_PARTS = ("runs", "transcripts", "logs", "github")
+
+MAX_INVENTORY_ENTRIES = 2000
+
+
+def _git(root: Path, *args: str) -> tuple[int, str]:
+    result = subprocess.run(
+        ["git", "-C", str(root), *args], capture_output=True, text=True
+    )
+    return result.returncode, result.stdout
+
+
+def _is_git_repo(root: Path) -> bool:
+    code, _ = _git(root, "rev-parse", "--is-inside-work-tree")
+    return code == 0
+
+
+def git_head(root: Path) -> str | None:
+    code, output = _git(root, "rev-parse", "HEAD")
+    return output.strip() if code == 0 and output.strip() else None
+
+
+def current_dirty_files(root: Path) -> set[str]:
+    """All modified, staged, added, renamed, and untracked paths."""
+    if not _is_git_repo(root):
+        return set()
+    code, output = _git(root, "status", "--porcelain")
+    if code != 0:
+        return set()
+    dirty: set[str] = set()
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        path_part = line[3:] if len(line) > 3 else ""
+        if "->" in path_part:
+            old, new = path_part.split("->", 1)
+            dirty.add(_normalize(old))
+            dirty.add(_normalize(new))
+        else:
+            dirty.add(_normalize(path_part))
+    dirty.discard("")
+    return dirty
+
+
+def owned_changes_since_baseline(root: Path, baseline_dirty: set[str]) -> set[str]:
+    """Dirty paths that were not already dirty before the run started."""
+    return current_dirty_files(root) - set(baseline_dirty)
+
+
+def _normalize(raw_path: str) -> str:
+    path = raw_path.strip().strip('"')
+    return Path(path).as_posix() if path else ""
+
+
+def _inventory(root: Path) -> list[str]:
+    entries: list[str] = []
+    for current_dir, dir_names, file_names in os.walk(root):
+        current_path = Path(current_dir)
+        dir_names[:] = [
+            name
+            for name in dir_names
+            if name not in EXCLUDED_DIR_NAMES
+            and not (current_path == root / ".metacoding" and name in EXCLUDED_METACODING_PARTS)
+        ]
+        for file_name in sorted(file_names):
+            if file_name == ".DS_Store":
+                continue
+            relative = (current_path / file_name).relative_to(root).as_posix()
+            entries.append(relative)
+            if len(entries) >= MAX_INVENTORY_ENTRIES:
+                return entries
+    return entries
+
+
+def detect_test_commands(root: Path) -> list[str]:
+    """Best-effort detection of the project's own test entry points."""
+    commands: list[str] = []
+    root = Path(root)
+    has_pytest_config = (root / "pytest.ini").is_file() or (root / "pyproject.toml").is_file()
+    has_test_files = bool(list(root.glob("test_*.py"))) or bool(
+        list(root.glob("tests/test_*.py"))
+    )
+    if has_pytest_config or has_test_files:
+        commands.append("python3 -m pytest -q")
+
+    package_json = root / "package.json"
+    if package_json.is_file():
+        content = package_json.read_text(encoding="utf-8")
+        if '"test"' in content:
+            commands.append("npm test")
+
+    makefile = root / "Makefile"
+    if makefile.is_file():
+        content = makefile.read_text(encoding="utf-8")
+        if any(line.startswith("test:") for line in content.splitlines()):
+            commands.append("make test")
+
+    if (root / "go.mod").is_file():
+        commands.append("go test ./...")
+    return commands
+
+
+def workspace_state(project_root: Path) -> dict[str, str]:
+    """Ground-truth workspace state: dirty-file set for git projects,
+    content hashes for plain directories."""
+    root = Path(project_root)
+    if _is_git_repo(root):
+        return {path: "dirty" for path in current_dirty_files(root)}
+    state: dict[str, str] = {}
+    for relative in _inventory(root):
+        data = (root / relative).read_bytes()
+        state[relative] = hashlib.sha256(data).hexdigest()
+    return state
+
+
+def detect_workspace_changes(
+    pre_state: Mapping[str, str],
+    post_state: Mapping[str, str],
+    *,
+    ignore_prefixes: tuple[str, ...] = (".metacoding/",),
+) -> set[str]:
+    """Paths created, deleted, or modified between two workspace states."""
+    changed = {
+        path
+        for path in set(pre_state) | set(post_state)
+        if pre_state.get(path) != post_state.get(path)
+    }
+    return {
+        path for path in changed if not path.startswith(ignore_prefixes)
+    }
+
+
+def capture_snapshot(project_root: Path) -> ProjectSnapshot:
+    """Record the deterministic starting state of a project."""
+    root = Path(project_root)
+    is_repo = _is_git_repo(root)
+    return ProjectSnapshot(
+        captured_at=now_utc(),
+        is_git_repo=is_repo,
+        git_head=git_head(root) if is_repo else None,
+        dirty_files=sorted(current_dirty_files(root)),
+        file_inventory=_inventory(root),
+        test_commands=detect_test_commands(root),
+    )

@@ -1,150 +1,151 @@
-# DevClaw
+# MetaCoding
 
-DevClaw is a project-local, acceptance-driven AI-native R&D team.
+MetaCoding is a project-local AI software development orchestration tool.
+Run it inside an existing project directory and it coordinates exactly three
+harnesses on a shared filesystem:
 
-Run it inside the project directory you want to modify. All natural-language requests are treated as work for the current project, and DevClaw stores its metadata under `.devclaw/`.
+1. **Planner harness** (Codex) — owns the PRD, architecture, implementation
+   plan, acceptance criteria, iteration decisions, and final acceptance.
+2. **Coder harness** (Pi) — implements the planner's contract directly in
+   the current project directory.
+3. **Tester harness** (Codex) — independently verifies the implementation
+   against the contract and produces evidence.
 
-## Quick Start
+MetaCoding itself is the deterministic host: it owns the state machine, the
+project lock, file ownership rules, structured protocols, safety gates, and
+optional GitHub delivery. It never pushes to protected branches and never
+force-pushes.
 
-Interactive mode:
+## Requirements
+
+- Python 3.10+ (`tomllib` from the standard library on 3.11+, or `tomli`)
+- `codex` CLI on PATH for the Planner and Tester harnesses
+- `pi` CLI on PATH for the Coder harness
+- `git` for delivery; optional `gh` for push / Pull Request / checks
+
+## Quick start
 
 ```bash
-scripts/devclaw start
+cd /path/to/your/project
+
+# interactive TUI
+metacoding            # or: python3 -m metacoding / scripts/metacoding
+
+# one-shot run
+metacoding run "Add an audit log to all administrative account changes."
 ```
 
-Or directly:
+Exit codes: `0` accepted/delivered, `1` blocked or human review required,
+`2` harness infrastructure failure, `3` usage/configuration/lock errors,
+`130` interrupted.
 
-```bash
-python3 -m devclaw
-```
-
-Non-interactive one-shot run:
-
-```bash
-python3 -m devclaw run "Build a customer feedback triage Agent"
-```
-
-Use real tool adapters explicitly:
-
-```bash
-python3 -m devclaw \
-  --executor codex \
-  --verifier deepseek \
-  --idle-timeout 900 \
-  run "Implement the next feature"
-```
-
-## Interactive Commands
-
-Natural language without `/` is always treated as a current-project R&D request.
+## Commands
 
 ```text
-/help                 Show help.
-/status               Show current project and metadata path.
-/config               Show runtime configuration.
-/context              Show project context.
-/refresh-context      Rescan project context.
-/memory               Show project memory summary.
-/history              Show request history.
-/decisions            Show architecture decisions.
-/research <topic>     Create a project-aware research report.
-/scaffold <type> <name> Create an agent or CLI scaffold spec.
-/risk                 Create a risk review report.
-/tasks <requirement>  Create a task DAG plan.
-/parallel-run <requirement> Run independent Codex subtasks in parallel.
-/paste-image [note]  Attach the current clipboard image to the next request.
-/attach <path> [note] Attach an image file to the next request.
-/attachments          List pending image attachments.
-/test                 Run detected project tests.
-/quality              Run/show quality report.
-/feedback <content>   Record feedback.
-/feedback-list        List feedback.
-/feedback-run <id>    Run feedback as a DevClaw task.
-/report               Print latest final delivery report.
-/artifacts            List latest artifacts.
-/sessions             Show previous requests.
-/diff                 Show current git diff if available.
-/clear                Visually separate output.
-/run <requirement>    Run one requirement explicitly.
-/exit                 Exit DevClaw.
+metacoding                      interactive TUI (default)
+metacoding run "REQUIREMENT"    one non-interactive run
+metacoding status               active or most recent run
+metacoding resume               resume an interrupted run
+metacoding report [--run-id ID] final report of a run
+metacoding artifacts [--run-id ID] artifact paths of a run
+metacoding cancel               cancel the active run
+metacoding deliver [--run-id ID] deliver an accepted run to git/GitHub
 ```
 
-Interactive sessions are resilient by design. If a single DevClaw task fails, the
-CLI prints a concise `Task failed` message and returns to the prompt instead of
-exiting the application. Natural-language requests are persisted before the run
-starts, so after a restart you can use the up/down arrow keys to recall earlier
-tasks and retry them.
+TUI commands: `/status`, `/report`, `/artifacts`, `/resume`, `/cancel`,
+`/deliver`, `/help`, `/exit`. Type any other text to start a run.
 
-## Project Output
+## Configuration
 
-DevClaw writes metadata and delivery artifacts under `.devclaw/`:
+Configuration lives in `<project>/.metacoding/config.toml` and never touches
+system-level Codex or Pi configuration. Each harness has its **own** model:
+
+```toml
+[harness.planner]
+provider = "codex"
+command = "codex"
+model = "planner-model"      # passed as `codex exec -m ...`
+
+[harness.coder]
+provider = "pi"
+command = "pi"
+model = "coding-model"       # passed as `pi -p --model ...`
+
+[harness.tester]
+provider = "codex"
+command = "codex"
+model = "tester-model"       # independent of the planner model
+```
+
+See [docs/metacoding/config.example.toml](docs/metacoding/config.example.toml)
+for the full schema (limits, policy, GitHub). Precedence is
+built-in defaults → `.metacoding/config.toml` → command-line overrides.
+Overrides apply to the current invocation only and are never written back:
 
 ```text
-.devclaw/
-  agents/
-  artifacts/
-  context/
-  delivery/latest/
-  feedback/
-  memory/
-  reports/
-  research/
-  stages/<project_id>/<session_id>/
-  scaffolds/
-  tasks/
-  acceptance-contract.json
-  final-delivery-report.json
-  project-brief.json
+--planner-model MODEL   --planner-command PATH
+--coder-model MODEL     --coder-command PATH
+--tester-model MODEL    --tester-command PATH
+--max-rounds N
 ```
 
-Delivery docs are written to `.devclaw/delivery/latest/` by default. DevClaw does not overwrite the project root `README.md`.
+Secrets are rejected in `config.toml`; harnesses inherit authentication from
+the current process environment.
 
-Every default R&D run is sequential: each Agent starts only after the previous Agent has produced output. Implementation is verified before final release and delivery reports are written. Reviewable Markdown for each phase is written under `.devclaw/stages/<project_id>/<session_id>/`, including `workflow-plan.md` and `index.md`. Parallel execution happens only when you explicitly run `/parallel-run`.
+## File layout
 
-Long-running Codex/Deepseek steps emit compact heartbeat lines about once per minute so the terminal shows which Agent is still active without dumping raw tool logs.
+```text
+docs/metacoding/          human-readable, committable contract documents
+  PRD.md ARCHITECTURE.md IMPLEMENTATION_PLAN.md ACCEPTANCE.md
+  TEST_REPORT.md FINAL_REPORT.md README.md
+.metacoding/              runtime metadata (see .gitignore)
+  config.toml             project configuration (committable, no secrets)
+  state.json              pointer to the active run
+  runs/<run-id>/          structured run history: run.json, initial-plan.json,
+                          rounds/round-NNN/*.json, transcripts/, git/, final.json
+  fake-scenario.json      fake-harness scripts for tests
+```
 
-Before each run, DevClaw writes `.devclaw/context/current-context-pack.md` from recent memory, session manifests, changed files, and stage document references. Deepseek then produces `.devclaw/context/semantic-context-summary.md` to select and summarize the context most relevant to the current request. Codex CLI acts as the workflow planner and classifies the request into the smallest safe mode, such as `targeted-change` or `bugfix`; local keyword routing is only a fallback when Codex planning is unavailable. Reused stages write `stage-reuse-note.md` instead of pretending the full research/PRD/design flow ran again.
+Planner documents are the development contract: the Coder and Tester work
+against `docs/metacoding/`, and every round's evidence is preserved under
+`.metacoding/runs/<run-id>/rounds/`.
 
-In interactive terminals, paste a screenshot with `Ctrl+V` or use `/paste-image`; DevClaw shows a pending image count in the prompt and attaches the image to the next requirement.
+## Recovery
 
-Default role assignment is tuned to each model family: Codex handles intake, UX
-research, architecture reasoning, technical planning, implementation, QA
-verification, and fix loops; Deepseek handles product research, PRD, test
-execution, code review, release review, delivery reporting, and archiving. Each
-role prompt asks the Agent to document skills used, reasoning, evidence, and
-output so stage artifacts remain auditable.
-
-## Current Capabilities
-
-- Project-local interactive CLI.
-- Slash command system.
-- Research-first workflow.
-- Sequential role workflow with per-stage Markdown outputs.
-- Codex-planned workflow routing with cross-session context packs.
-- Deepseek-generated semantic context summaries and acceptance checks.
-- Screenshot attachment from clipboard or file before a run.
-- Persistent prompt history with arrow-key recall across restarts.
-- Recoverable interactive task failures that keep DevClaw running.
-- Agent role specifications.
-- Acceptance Contract generation.
-- DevClaw Lead loop with verification and rework.
-- Project context scanning.
-- Project memory.
-- Feedback capture and feedback-driven runs.
-- Quality checks based on detected test commands.
-- Safe project-local delivery.
-- Codex CLI and Deepseek TUI adapter shells.
-- Codex CLI adapter uses non-interactive `codex exec -C <project> --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox`.
-- Real tool calls use an idle-output monitor, not a hard total timeout. Long-running Codex/Deepseek work may continue as long as the process keeps producing output; DevClaw only treats it as stalled after `--idle-timeout` seconds with no stdout/stderr activity.
-
-## Test
+Every state transition is persisted atomically before the next harness
+starts. If the process is interrupted, run:
 
 ```bash
-python3 -m pytest -q
+metacoding status   # see the persisted state
+metacoding resume   # continue from the exact pending stage
 ```
 
-## Design Docs
+Terminal runs (delivered / blocked / failed infrastructure / human review /
+cancelled) cannot be resumed. One MetaCoding run is active per project at a
+time (`.metacoding/active-run.lock`); stale locks from dead processes are
+detected and replaced, live ones are never overwritten.
 
-- [DevClaw Design](docs/plans/devclaw-design.md)
-- [DevClaw Roadmap and Product Plan](docs/plans/devclaw-roadmap.md)
-- [DevClaw v0.1 Implementation Plan](docs/plans/2026-06-14-devclaw-v0.1-implementation.md)
+## GitHub delivery (optional, off by default)
+
+After local acceptance and all deterministic gates pass, MetaCoding can
+deliver on a dedicated `metacoding/<run-id>` branch:
+
+- only the run's owned files are staged — never your pre-existing dirty files
+- no force-push, no rewriting of existing commits, never the default branch
+- push / Pull Request / check waiting require explicit `[github]` opt-in
+- failed required checks (with `wait_for_checks = true`) send the run back to
+  tester evidence and planner review once before a warning is recorded
+
+## Development
+
+```bash
+python3 -m pytest -q                # full suite (offline, fake harnesses)
+python3 -m pytest tests/metacoding/test_orchestrator.py -q
+python3 -m metacoding --help
+```
+
+Real-harness integration tests are skipped unless explicitly enabled with
+environment variables (see `tests/metacoding/test_real_integrations.py`).
+
+Design documents: [docs/plans/2026-09-07-metacoding-design.md](docs/plans/2026-09-07-metacoding-design.md)
+and [docs/plans/2026-09-07-metacoding-implementation.md](docs/plans/2026-09-07-metacoding-implementation.md).

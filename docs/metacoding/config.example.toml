@@ -1,0 +1,47 @@
+# Example MetaCoding project configuration.
+# Copy to <project>/.metacoding/config.toml and adjust per project.
+# Never put tokens or API keys in this file; harnesses inherit the
+# current process environment for authentication.
+
+[project]
+schema_version = 1
+
+[limits]
+max_rounds = 6
+same_failure_limit = 2
+idle_timeout_seconds = 900
+
+[harness.planner]
+provider = "codex"
+command = "codex"
+model = "planner-model"
+extra_args = []
+
+[harness.coder]
+provider = "pi"
+command = "pi"
+model = "coding-model"
+extra_args = []
+
+[harness.tester]
+provider = "codex"
+command = "codex"
+model = "tester-model"
+extra_args = []
+
+[policy]
+allow_network = false
+allow_destructive_commands = false
+tester_can_modify_source = false
+
+# Remote delivery is disabled by default. When enabled, MetaCoding pushes
+# only from a dedicated metacoding/<run-id> branch and never force-pushes.
+[github]
+enabled = false
+remote = "origin"
+mode = "pull-request"
+branch_prefix = "metacoding/"
+auto_commit = true
+auto_push = false
+auto_create_pr = false
+wait_for_checks = true

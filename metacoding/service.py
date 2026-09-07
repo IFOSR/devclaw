@@ -1,0 +1,283 @@
+"""Application service layer used by the CLI and TUI.
+
+Wires configuration, harnesses, the orchestrator, and delivery behind the
+small command surface the CLI dispatches to. Every command returns an
+:class:`metacoding.cli.Outcome` with an operator-readable message and a
+process exit code.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Callable
+
+from metacoding.cli import (
+    EXIT_INFRASTRUCTURE,
+    EXIT_OK,
+    EXIT_RUN_REJECTED,
+    EXIT_USAGE,
+    Outcome,
+)
+from metacoding.config import CliOverrides, load_config
+from metacoding.errors import MetaCodingError, PersistenceError
+from metacoding.harnesses import create_harness
+from metacoding.locking import read_lock
+from metacoding.models import RunStatus
+from metacoding.orchestrator import EXIT_BY_STATUS, Orchestrator, OrchestratorResult
+from metacoding.persistence import RunStore
+
+EVENT = Callable[[dict], None]
+
+
+def default_emitter() -> EVENT:
+    """Print concise lifecycle lines for non-interactive commands."""
+
+    def emit(event: dict) -> None:
+        if event.get("kind") == "phase":
+            print(f"[{event.get('phase')}] {event.get('message', '')}")
+        elif event.get("kind") == "info":
+            print(event.get("message", ""))
+
+    return emit
+
+
+class MetaCodingService:
+    """Application entry points for start, run, resume, and reporting."""
+
+    def __init__(
+        self,
+        project_root: Path | None = None,
+        overrides: CliOverrides | None = None,
+    ) -> None:
+        self.project_root = Path(project_root) if project_root else Path.cwd()
+        self.overrides = overrides
+        self.store = RunStore(self.project_root)
+
+    # --- collaborators -----------------------------------------------------------
+
+    def _config(self):
+        return load_config(self.project_root, self.overrides)
+
+    def _orchestrator(self, config, emit: EVENT | None = None) -> Orchestrator:
+        harnesses = {
+            name: create_harness(name, harness_config, self.project_root)
+            for name, harness_config in config.harness.items()
+        }
+        deliverer = None
+        if config.github.enabled:
+            from metacoding.github import GitDeliverer
+
+            deliverer = GitDeliverer(self.project_root, config)
+        return Orchestrator(
+            self.project_root,
+            config,
+            harnesses,
+            emit=emit,
+            deliverer=deliverer,
+            store=self.store,
+        )
+
+    # --- run lifecycle -------------------------------------------------------------
+
+    def run(self, requirement: str, emit: EVENT | None = None) -> Outcome:
+        try:
+            config = self._config()
+            orchestrator = self._orchestrator(
+                config, emit=emit if emit is not None else default_emitter()
+            )
+            result = orchestrator.start(requirement)
+        except MetaCodingError as exc:
+            return Outcome("error", EXIT_USAGE, str(exc))
+        return self._outcome(result)
+
+    def resume(self, emit: EVENT | None = None) -> Outcome:
+        try:
+            config = self._config()
+            orchestrator = self._orchestrator(
+                config, emit=emit if emit is not None else default_emitter()
+            )
+            result = orchestrator.resume()
+        except MetaCodingError as exc:
+            return Outcome("error", EXIT_USAGE, str(exc))
+        return self._outcome(result)
+
+    def cancel(self) -> Outcome:
+        try:
+            config = self._config()
+            orchestrator = Orchestrator(
+                self.project_root, config, {}, store=self.store
+            )
+            result = orchestrator.cancel()
+        except MetaCodingError as exc:
+            return Outcome("error", EXIT_USAGE, str(exc))
+        return self._outcome(result)
+
+    def deliver(self, run_id: str | None = None) -> Outcome:
+        target = run_id or self.store.latest_run_id()
+        if target is None:
+            return Outcome("error", EXIT_USAGE, "no runs found; nothing to deliver")
+        final = self.store.load_final(target)
+        if final is None:
+            record = self.store.load_run(target)
+            return Outcome(
+                "error",
+                EXIT_USAGE,
+                f"run {target} has not finished (status: {record.status.value}); "
+                "only accepted runs can be delivered",
+            )
+        if final.outcome not in ("delivered", "accepted"):
+            return Outcome(
+                "error",
+                EXIT_RUN_REJECTED,
+                f"run {target} ended as {final.outcome}; nothing to deliver",
+            )
+        try:
+            from metacoding.github import GitDeliverer
+
+            config = self._config()
+            deliverer = GitDeliverer(self.project_root, config)
+            summary = deliverer.deliver(
+                target, owned_files=sorted(_owned_files(self.store, target))
+            )
+        except MetaCodingError as exc:
+            return Outcome("error", EXIT_USAGE, f"delivery failed: {exc}")
+        lines = [f"- {key}: {value}" for key, value in summary.items()]
+        return Outcome("delivered", EXIT_OK, f"delivered run {target}", lines)
+
+    # --- inspection ------------------------------------------------------------------
+
+    def overview(self) -> list[str]:
+        try:
+            config = self._config()
+            lines = [f"Project  {self.project_root}"]
+            for name, title in (("planner", "Planner"), ("coder", "Coder"), ("tester", "Tester")):
+                harness = config.harness[name]
+                model = harness.model or "(cli default)"
+                lines.append(f"{title:<8} {harness.provider} / {model}")
+            lock = read_lock(self.project_root)
+            if lock is not None:
+                lines.append(f"Active   run {lock.run_id} (pid {lock.pid})")
+            return lines
+        except MetaCodingError as exc:
+            return [f"Project  {self.project_root}", f"Config   {exc}"]
+
+    def status(self) -> Outcome:
+        state = self.store.read_state()
+        if state and state.get("active_run_id"):
+            run_id = str(state["active_run_id"])
+            try:
+                record = self.store.load_run(run_id)
+            except PersistenceError as exc:
+                return Outcome("error", EXIT_USAGE, str(exc))
+            lock = read_lock(self.project_root)
+            lines = [
+                f"run id:    {run_id}",
+                f"status:    {record.status.value}",
+                f"round:     {record.current_round}",
+                f"requirement: {record.requirement}",
+            ]
+            if lock is not None:
+                lines.append(f"owner:     pid {lock.pid} on {lock.host}")
+            return Outcome("active", EXIT_OK, "an unfinished run is active", lines)
+
+        latest = self.store.latest_run_id()
+        if latest is None:
+            return Outcome(
+                "idle",
+                EXIT_OK,
+                "no runs recorded for this project",
+                [
+                    "start with: metacoding run \"<requirement>\"",
+                    "harnesses are configured in .metacoding/config.toml "
+                    "(see docs/metacoding/config.example.toml)",
+                ],
+            )
+        final = self.store.load_final(latest)
+        if final is not None:
+            return Outcome(
+                "finished",
+                EXIT_OK,
+                f"last run {latest} finished as {final.outcome}",
+                [f"reason: {final.reason}", f"rounds: {final.rounds_used}"],
+            )
+        record = self.store.load_run(latest)
+        return Outcome(
+            "finished",
+            EXIT_OK,
+            f"last run {latest} has status {record.status.value}",
+        )
+
+    def report(self, run_id: str | None = None) -> Outcome:
+        target = run_id or self.store.latest_run_id()
+        if target is None:
+            return Outcome("error", EXIT_USAGE, "no runs found")
+        final = self.store.load_final(target)
+        if final is None:
+            record = self.store.load_run(target)
+            return Outcome(
+                "unfinished",
+                EXIT_OK,
+                f"run {target} has not finished (status: {record.status.value})",
+                [f"requirement: {record.requirement}"],
+            )
+        lines = [
+            f"outcome: {final.outcome}",
+            f"reason:  {final.reason}",
+            f"summary: {final.summary}",
+            f"rounds:  {final.rounds_used}",
+        ]
+        if final.warnings:
+            lines.append("warnings:")
+            lines.extend(f"  - {warning}" for warning in final.warnings)
+        if final.github:
+            lines.append("github:")
+            lines.extend(f"  - {key}: {value}" for key, value in final.github.items())
+        lines.append("artifacts:")
+        lines.extend(f"  - {name}: {path}" for name, path in final.artifacts.items())
+        return Outcome("report", EXIT_OK, f"final report for run {target}", lines)
+
+    def artifacts(self, run_id: str | None = None) -> Outcome:
+        target = run_id or self.store.latest_run_id()
+        if target is None:
+            return Outcome("error", EXIT_USAGE, "no runs found")
+        final = self.store.load_final(target)
+        run_dir = self.store.run_dir(target)
+        lines = [
+            f"run dir: {run_dir}",
+            f"request: {run_dir / 'request.md'}",
+            f"plan:    {run_dir / 'initial-plan.json'}",
+            f"final:   {run_dir / 'final.json'}",
+            f"docs:    {self.store.docs_dir()}",
+        ]
+        if final is not None:
+            lines.extend(f"{name}: {path}" for name, path in final.artifacts.items())
+        else:
+            lines.append("(run unfinished; round and transcript files under run dir)")
+        return Outcome("artifacts", EXIT_OK, f"artifacts for run {target}", lines)
+
+    # --- helpers ------------------------------------------------------------------------
+
+    @staticmethod
+    def _outcome(result: OrchestratorResult) -> Outcome:
+        lines = [
+            f"status:  {result.status.value}",
+            f"run id:  {result.run_id}",
+            f"rounds:  {result.final.rounds_used}",
+            f"report:  docs/metacoding/FINAL_REPORT.md",
+        ]
+        if result.final.warnings:
+            lines.append(f"warnings: {len(result.final.warnings)} (see final report)")
+        return Outcome(
+            result.status.value,
+            result.exit_code,
+            result.message or result.final.reason,
+            lines,
+            run_id=result.run_id,
+        )
+
+
+def _owned_files(store: RunStore, run_id: str) -> set[str]:
+    owned: set[str] = set()
+    for round_record in store.load_rounds(run_id).values():
+        owned.update(round_record.changed_files)
+    return owned
