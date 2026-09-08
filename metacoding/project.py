@@ -66,6 +66,22 @@ def git_head(root: Path) -> str | None:
     return output.strip() if code == 0 and output.strip() else None
 
 
+#: File suffixes that are compiled artifacts, never ownership-relevant.
+VOLATILE_FILE_SUFFIXES = (".pyc", ".pyo", ".DS_Store")
+
+
+def _is_volatile_path(path: str) -> bool:
+    """Volatile build/cache artifacts: invisible to change tracking.
+
+    Harnesses legitimately execute the project's test commands, which
+    creates __pycache__/.pytest_cache litter; treating those as writes would
+    false-positive the stage write guard and pollute owned diffs.
+    """
+    return any(part in EXCLUDED_DIR_NAMES for part in path.split("/")) or path.endswith(
+        VOLATILE_FILE_SUFFIXES
+    )
+
+
 def current_dirty_files(root: Path) -> set[str]:
     """All modified, staged, added, renamed, and untracked paths.
 
@@ -89,7 +105,7 @@ def current_dirty_files(root: Path) -> set[str]:
         else:
             dirty.add(_normalize(path_part))
     dirty.discard("")
-    return dirty
+    return {path for path in dirty if not _is_volatile_path(path)}
 
 
 def owned_changes_since_baseline(root: Path, baseline_dirty: set[str]) -> set[str]:

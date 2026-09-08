@@ -69,7 +69,10 @@ Your job:
 5. Note PRD drift, regression risks, and missing tests.
 
 Constraints:
-- Do NOT modify product source code or product tests. You may only create temporary artifacts under .metacoding/.
+- Do NOT modify product source code or product tests.
+- You may ONLY write these files: the structured report path above and
+  {ctx.docs_dir / 'TEST_REPORT.md'}. Anything else (including scratch
+  files under .metacoding/) will block the run.
 - Report what you actually observed; never invent passing results.
 
 Write your report as a JSON object to EXACTLY this path: {ctx.report_dir / 'test-payload.json'}

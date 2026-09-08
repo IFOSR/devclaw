@@ -551,6 +551,8 @@ class Orchestrator:
         tester_payload_files = {
             f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/test-payload.json",
             f".metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/test-payload.last-message",
+            # The tester owns the human-readable report document.
+            "docs/metacoding/TEST_REPORT.md",
         }
         self._guard_stage_writes(
             record,
@@ -989,7 +991,10 @@ class Orchestrator:
                 raise InfrastructureFailure(
                     f"harness command unavailable: {exc}"
                 ) from exc
-        raise InfrastructureFailure(f"{stage} failed after retry: {last_error}")
+        raise InfrastructureFailure(
+            f"{stage} failed after retry: {last_error}\n"
+            f"transcripts: {self.store.run_dir(record.run_id) / 'transcripts'}"
+        )
 
     def _make_transcript_sink(self, harness: Harness, stage: str, run_id: str, attempt: int):
         def sink(stage_name: str, result) -> None:

@@ -12,6 +12,7 @@ from metacoding.project import (
     current_dirty_files,
     detect_test_commands,
     owned_changes_since_baseline,
+    workspace_state,
 )
 
 
@@ -121,3 +122,23 @@ def test_current_dirty_files_handles_renames(tmp_path: Path) -> None:
     dirty = current_dirty_files(tmp_path)
     assert "README.md" in dirty
     assert "RENAMED.md" in dirty
+
+
+def test_volatile_build_artifacts_are_never_dirty(tmp_path: Path) -> None:
+    """__pycache__/*.pyc created by harness-run test executions must not be
+    treated as workspace changes (scope-guard false positives)."""
+    init_repo(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    pycache = tmp_path / "src" / "__pycache__"
+    pycache.mkdir()
+    (pycache / "app.cpython-310.pyc").write_bytes(b"\x00compiled")
+    (tmp_path / ".pytest_cache" / "v").mkdir(parents=True)
+    (tmp_path / ".pytest_cache" / "v" / "caplog").write_bytes(b"")
+    dirty = current_dirty_files(tmp_path)
+    assert "src/app.py" in dirty
+    assert not any("__pycache__" in path or path.endswith(".pyc") for path in dirty)
+    assert not any(".pytest_cache" in path for path in dirty)
+    # and they stay invisible in workspace snapshots / ownership math
+    state = workspace_state(tmp_path)
+    assert not any("__pycache__" in path or ".pytest_cache" in path for path in state)

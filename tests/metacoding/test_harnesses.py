@@ -323,3 +323,17 @@ def test_scenario_steps_advance_by_attempt(tmp_path: Path) -> None:
     (ctx.report_dir / "review-payload.json").unlink(missing_ok=True)
     second = planner.review(ctx)
     assert second.decision == "accept"
+
+
+def test_nonzero_exit_surfaces_output_tail(tmp_path: Path) -> None:
+    """The operator must see the harness's actual error inline, not just a
+    pointer to transcripts."""
+    scenario = {"attempts": {"plan": [{"behavior": "nonzero"}]}}
+    planner = FakePlanner(fake_harness_config(tmp_path, scenario, "planner"), tmp_path)
+    ctx = make_context(tmp_path)
+    ctx.report_dir.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(HarnessNonZeroExit) as excinfo:
+        planner.plan(ctx)
+    message = str(excinfo.value)
+    assert "fake harness failure" in message  # stderr tail inlined
+    assert "exit" in message

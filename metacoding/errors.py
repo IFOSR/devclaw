@@ -69,8 +69,10 @@ class HarnessTimeout(HarnessError):
 class HarnessNonZeroExit(HarnessError):
     """The harness process exited with a non-zero status."""
 
-    def __init__(self, message: str, *, command: list[str], exit_code: int) -> None:
-        super().__init__(message, command=command, exit_code=exit_code)
+    def __init__(
+        self, message: str, *, command: list[str], exit_code: int
+    ) -> None:
+        super().__init__(message)
         self.command = command
         self.exit_code = exit_code
 

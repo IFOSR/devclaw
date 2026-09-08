@@ -870,3 +870,46 @@ def test_final_report_commit_failure_is_recorded_in_final(tmp_path: Path) -> Non
         (orchestrator.store.run_dir(result.run_id) / "final.json").read_text("utf-8")
     )
     assert any("could not be committed" in w for w in final_json["warnings"])
+
+
+def test_coder_running_tests_creating_pycache_is_not_blocked(tmp_path: Path) -> None:
+    import subprocess as sp
+
+    sp.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / ".gitignore").write_text("", encoding="utf-8")  # nothing ignored at all
+    sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True, capture_output=True)
+    sp.run(
+        ["git", "-C", str(tmp_path), "-c", "user.email=a@b.c", "-c", "user.name=x",
+         "commit", "-q", "-m", "init"],
+        check=True, capture_output=True,
+    )
+    # the coder writes sources AND the pycache litter a pytest run creates
+    script = scenario(
+        code=[
+            code_payload(
+                files={
+                    "src/audit.py": "log()\n",
+                    "src/__pycache__/audit.cpython-310.pyc": "\x00compiled",
+                    ".pytest_cache/v/cache": "x",
+                }
+            )
+        ]
+    )
+    orchestrator, _ = make_orchestrator(tmp_path, script)
+    result = orchestrator.start("add audit logging")
+    assert result.status is RunStatus.DELIVERED
+
+
+def test_tester_writing_its_own_test_report_is_allowed(tmp_path: Path) -> None:
+    """Real testers write docs/metacoding/TEST_REPORT.md per their prompt;
+    the stage write guard must allow exactly that file."""
+    script = scenario(
+        test=[
+            make_test_step(
+                files={"docs/metacoding/TEST_REPORT.md": "# Test Report\n\nwritten by tester\n"}
+            )
+        ]
+    )
+    orchestrator, _ = make_orchestrator(tmp_path, script)
+    result = orchestrator.start("add audit logging")
+    assert result.status is RunStatus.DELIVERED

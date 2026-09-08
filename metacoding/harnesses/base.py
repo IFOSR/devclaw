@@ -104,6 +104,20 @@ class HarnessTask:
     last_message_path: Path
 
 
+def _output_tail(*streams: str, max_lines: int = 6, max_chars: int = 600) -> str:
+    """Last non-empty lines across the given output streams, for error messages."""
+    lines: list[str] = []
+    for stream in streams:
+        for line in stream.splitlines():
+            stripped = line.strip()
+            if stripped:
+                lines.append(stripped)
+    tail = "\n".join(lines[-max_lines:])
+    if len(tail) > max_chars:
+        tail = "..." + tail[-max_chars:]
+    return tail
+
+
 def strip_code_fences(text: str) -> str:
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -209,9 +223,10 @@ class Harness(ABC):
                 idle_seconds=result.idle_timeout_seconds,
             )
         if result.exit_code != 0:
+            tail = _output_tail(result.stderr, result.stdout)
             raise HarnessNonZeroExit(
-                f"{self.provider}-{self.name} exited with code {result.exit_code}; "
-                f"see transcript for details",
+                f"{self.provider}-{self.name} exited with code {result.exit_code}"
+                + (f"\nlast output:\n{tail}" if tail else ""),
                 command=command,
                 exit_code=result.exit_code,
             )
