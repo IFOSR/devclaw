@@ -160,3 +160,46 @@ def test_reasoning_items_are_silent():
         ],
     )
     assert out == ""
+
+
+def test_pi_jsonl_formatter_renders_tool_activity():
+    from metacoding.stream_format import PiJsonlFormatter
+
+    f = PiJsonlFormatter()
+    events = [
+        json.dumps({"type": "message_update", "assistantMessageEvent": {"type": "toolcall_start", "toolName": "write"}}),
+        json.dumps({"type": "tool_execution_start", "toolName": "write",
+                    "args": {"path": "/x/hi.txt", "content": "hello"}}),
+        json.dumps({"type": "tool_execution_end", "toolName": "write",
+                    "result": {"content": [{"type": "text", "text": "Successfully wrote 5 bytes"}]}, "isError": False}),
+        json.dumps({"type": "tool_execution_start", "toolName": "bash",
+                    "args": {"command": "python3 -m pytest -q"}}),
+        json.dumps({"type": "turn_end", "message": {"role": "assistant",
+                    "content": [{"type": "text", "text": "Created hi.txt containing hello."}],
+                    "usage": {"input": 10, "output": 5}}}),
+    ]
+    out = feed_all(f, [e + "\n" for e in events])
+    lines = out.strip().splitlines()
+    assert lines[0] == "│ calling write…"
+    assert lines[1] == "│ write: /x/hi.txt"
+    assert lines[2] == "│ ✓ write: Successfully wrote 5 bytes"
+    assert lines[3] == "│ bash: python3 -m pytest -q"
+    assert "Created hi.txt containing hello." in out
+    assert "tokens: in 10 out 5" in out
+
+
+def test_pi_jsonl_drops_noise_and_errors():
+    from metacoding.stream_format import PiJsonlFormatter
+
+    f = PiJsonlFormatter()
+    out = feed_all(
+        f,
+        [
+            json.dumps({"type": "session", "version": 3}) + "\n",
+            json.dumps({"type": "agent_start"}) + "\n",
+            json.dumps({"type": "tool_execution_end", "toolName": "write", "isError": True}) + "\n",
+        ],
+    )
+    assert "│ write: error" in out
+    assert "agent_start" not in out
+    assert "session" not in out

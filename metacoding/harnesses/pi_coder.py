@@ -15,7 +15,7 @@ class PiCoder(Harness):
         from metacoding.harnesses.base import HarnessTask
 
         task: HarnessTask = self.build_task(stage, ctx)
-        command = [self.config.command, "-p"]
+        command = [self.config.command, "-p", "--mode", "json"]
         if self.config.model:
             command += ["--model", self.config.model]
         command += ["--no-session"]

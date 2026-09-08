@@ -114,6 +114,7 @@ def test_coder_command_contains_pi_model_and_prompt(tmp_path: Path) -> None:
     command = coder.build_command("code", ctx)
     assert command[0] == "pi"
     assert "-p" in command
+    assert "--mode" in command and command[command.index("--mode") + 1] == "json"
     assert "--model" in command and command[command.index("--model") + 1] == "coder-model"
     prompt_argument = command[-1]
     assert "add audit logging" in prompt_argument

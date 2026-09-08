@@ -17,6 +17,103 @@ def _preview(text: str, limit: int = PREVIEW_LIMIT) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+class PiJsonlFormatter:
+    """Render pi's ``--mode json`` event stream into readable lines.
+
+    Highlights tool executions (file writes, shell commands) and the final
+    answer, keeping the Coder's activity visible instead of a black box.
+    """
+
+    def __init__(self, prefix: str = "│ ") -> None:
+        self.prefix = prefix
+        self._buffer = ""
+
+    def feed(self, chunk: str) -> str:
+        self._buffer += chunk
+        rendered: list[str] = []
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            text = self.render_line(line)
+            if text:
+                rendered.append(self.prefix + text + "\n")
+        return "".join(rendered)
+
+    def flush(self) -> str:
+        remainder, self._buffer = self._buffer, ""
+        text = self.render_line(remainder)
+        return (self.prefix + text + "\n") if text else ""
+
+    def render_line(self, line: str) -> str:
+        line = line.strip()
+        if not line:
+            return ""
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return _preview(line)
+        if not isinstance(event, dict):
+            return ""
+        kind = event.get("type")
+
+        if kind in ("session", "agent_start", "agent_end", "agent_settled",
+                    "turn_start", "message_start", "message_end"):
+            return ""
+        if kind == "message_update":
+            inner = event.get("assistantMessageEvent") or {}
+            inner_type = inner.get("type")
+            if inner_type == "toolcall_start":
+                return f"calling {inner.get('toolName', 'tool')}…"
+            if inner_type in ("thinking_start", "thinking_delta", "thinking"):
+                return ""
+            return ""
+        if kind == "tool_execution_start":
+            tool = event.get("toolName", "tool")
+            args = event.get("args") or {}
+            return f"{tool}: {self._args_preview(tool, args)}"
+        if kind == "tool_execution_end":
+            tool = event.get("toolName", "tool")
+            if event.get("isError"):
+                return f"{tool}: error"
+            text = self._result_preview(event.get("result"))
+            return f"✓ {tool}" + (f": {text}" if text else "")
+        if kind == "turn_end":
+            message = event.get("message") or {}
+            text = " ".join(
+                str(part.get("text", "")).strip()
+                for part in message.get("content", [])
+                if isinstance(part, dict) and part.get("type") == "text"
+            ).strip()
+            usage = message.get("usage") or {}
+            if text and usage:
+                return f"{_preview(text)}\n  tokens: in {usage.get('input', '?')} out {usage.get('output', '?')}"
+            return _preview(text) if text else ""
+        if kind in ("text_delta", "thinking_delta", "thinking",
+                    "text_start", "text_end", "thinking_end",
+                    "toolcall_delta", "toolcall_end"):
+            return ""
+        return _preview(kind)
+
+    @staticmethod
+    def _args_preview(tool: str, args: dict) -> str:
+        if tool in ("write", "edit", "read", "apply_patch", "multi_edit"):
+            path = args.get("path") or args.get("file_path") or ""
+            return _preview(str(path))
+        if tool in ("bash", "execute", "run"):
+            command = args.get("command") or args.get("cmd") or ""
+            return _preview(str(command))
+        keys = list(args.keys())[:2]
+        return _preview(", ".join(str(args[k])[:60] for k in keys))
+
+    @staticmethod
+    def _result_preview(result) -> str:
+        if not isinstance(result, dict):
+            return ""
+        for part in result.get("content") or []:
+            if isinstance(part, dict) and part.get("type") == "text":
+                return _preview(str(part.get("text", "")))
+        return ""
+
+
 class CodexJsonlFormatter:
     """Buffer chunks, render complete JSONL lines as friendly text."""
 

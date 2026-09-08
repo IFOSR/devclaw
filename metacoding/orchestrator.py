@@ -1107,15 +1107,15 @@ class Orchestrator:
         )
 
     def _make_stream_sink(self, harness: Harness, stage: str, run_id: str):
-        from metacoding.stream_format import CodexJsonlFormatter
+        from metacoding.stream_format import CodexJsonlFormatter, PiJsonlFormatter
 
-        # codex stdout is JSONL (--json); render it human-friendly. pi already
-        # streams plain text; stderr stays verbatim for both.
-        formatter = (
-            CodexJsonlFormatter()
-            if harness.provider == "codex"
-            else None
-        )
+        # codex stdout is JSONL (--json) and pi stdout is JSONL (--mode json);
+        # render both human-friendly. stderr stays verbatim for both.
+        formatter = None
+        if harness.provider == "codex":
+            formatter = CodexJsonlFormatter()
+        elif harness.provider == "pi":
+            formatter = PiJsonlFormatter()
 
         def sink(stage_name: str, stream: str, text: str) -> None:
             rendered = text
