@@ -57,7 +57,14 @@ metacoding config set KEY VALUE  persist a setting to .metacoding/config.toml
 
 TUI commands: `/status`, `/report`, `/artifacts`, `/resume`, `/cancel`,
 `/deliver`, `/config [get KEY | set KEY VALUE]`, `/help`, `/exit`. Type any
-other text to start a run.
+other text to start a run. Commands are case-insensitive and `/exit`
+ignores trailing arguments. On a real terminal the input line borrows
+`prompt_toolkit` (history with arrow keys, slash-command completion) and
+rendering borrows `rich` (banner, colored lifecycle lines); both degrade
+g gracefully to plain stdio when unavailable, and
+`METACODING_TUI_PLAIN=1` forces the plain input path. Operator-command
+errors (e.g. a corrupt `state.json`) are reported as readable messages —
+the TUI loop never crashes on them.
 
 ### Setting models persistently
 

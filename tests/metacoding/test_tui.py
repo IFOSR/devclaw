@@ -173,3 +173,137 @@ def test_config_command_in_tui() -> None:
 def test_config_bad_usage_shows_hint() -> None:
     output = drive(FakeApp(), "/config set only-key\n/exit\n")
     assert "usage: /config" in output
+
+
+# --- bug regressions: robustness, case-insensitivity, trailing args -----------------
+
+
+class ExplodingApp(FakeApp):
+    """Every operator command raises; the TUI must survive all of them."""
+
+    def status(self):
+        raise RuntimeError("corrupt state boom")
+
+    def report(self, run_id=None):
+        raise KeyError("corrupt final.json")
+
+    def artifacts(self, run_id=None):
+        raise ValueError("corrupt artifacts")
+
+    def resume(self, emit=None):
+        raise OSError("resume exploded")
+
+    def cancel(self):
+        raise ZeroDivisionError("cancel exploded")
+
+    def config_list(self):
+        raise RuntimeError("config exploded")
+
+
+def test_operator_command_exceptions_do_not_kill_the_tui() -> None:
+    app = ExplodingApp()
+    output = drive(
+        app,
+        "/status\n/report\n/artifacts\n/resume\n/cancel\n/config\n/help\n/exit\n",
+    )
+    for fragment in (
+        "/status failed: RuntimeError: corrupt state boom",
+        "/report failed: KeyError",
+        "/artifacts failed: ValueError",
+        "/resume failed: OSError",
+        "/cancel failed: ZeroDivisionError",
+        "/config failed: RuntimeError",
+    ):
+        assert fragment in output
+    # the loop kept working afterwards
+    assert "Commands:" in output
+
+
+def test_command_names_are_case_insensitive() -> None:
+    app = FakeApp()
+    output = drive(app, "/STATUS\n/Help\n/EXIT\n")
+    assert ("status",) in app.calls
+    assert "Commands:" in output
+
+
+def test_exit_with_trailing_arguments_still_exits() -> None:
+    app = FakeApp()
+    stdout = io.StringIO()
+    code = run_tui(app, stdin=io.StringIO("/exit now please\n"), stdout=stdout)
+    assert code == EXIT_OK
+    assert "unknown command" not in stdout.getvalue()
+    # /quit alias also ignores trailing text
+    code = run_tui(app, stdin=io.StringIO("/QUIT\n/status\n/exit\n"), stdout=io.StringIO())
+    assert code == EXIT_OK
+
+
+def test_persistence_errors_surface_as_readable_outcomes() -> None:
+    from metacoding.cli import EXIT_USAGE
+    from metacoding.errors import PersistenceError
+    from metacoding.service import MetaCodingService
+
+    class ExplodingStore:
+        def read_state(self):
+            raise PersistenceError("cannot read JSON artifact state.json: bad")
+
+    service = MetaCodingService(project_root=Path("/tmp/never-used"))
+    service.store = ExplodingStore()
+    outcome = service.status()
+    assert outcome.exit_code == EXIT_USAGE
+    assert "state.json" in outcome.message
+
+    class NoFinalStore(ExplodingStore):
+        def latest_run_id(self):
+            return "r-1"
+
+        def load_final(self, run_id):
+            raise PersistenceError("cannot read final.json: bad")
+
+        def read_state(self):
+            return None
+
+    service.store = NoFinalStore()
+    assert "final.json" in service.report().message
+
+
+def test_cli_main_converts_exceptions_to_concise_errors() -> None:
+    from metacoding.cli import EXIT_USAGE
+
+    class BrokenApp(FakeApp):
+        def status(self):
+            raise RuntimeError("kaboom")
+
+    stdout_err = io.StringIO()
+    import contextlib
+
+    with contextlib.redirect_stderr(stdout_err):
+        code = run_cli_main_with(BrokenApp())
+    assert code == EXIT_USAGE
+    assert "RuntimeError: kaboom" in stdout_err.getvalue()
+    assert "Traceback" not in stdout_err.getvalue()
+
+
+def run_cli_main_with(app):
+    from metacoding import cli
+
+    return cli.main(["status"], app=app)
+
+
+def test_plain_rendering_fallback_without_rich() -> None:
+    import metacoding.tui as tui_module
+
+    app = FakeApp()
+    stdout = io.StringIO()
+    had_rich, tui_module._HAVE_RICH = tui_module._HAVE_RICH, False
+    try:
+        renderer = tui_module._Renderer(stdout)
+        renderer.banner(["Project  /tmp/demo"])
+        renderer.phase("planning", "Planner is analyzing.")
+        renderer.error("boom")
+    finally:
+        tui_module._HAVE_RICH = had_rich
+    output = stdout.getvalue()
+    assert "MetaCoding" in output and "Project  /tmp/demo" in output
+    assert "[planning] Planner is analyzing." in output
+    assert "boom" in output
+    assert "─" not in output  # no rich rule borders in plain mode

@@ -255,7 +255,10 @@ class MetaCodingService:
             return [f"Project  {self.project_root}", f"Config   {exc}"]
 
     def status(self) -> Outcome:
-        state = self.store.read_state()
+        try:
+            state = self.store.read_state()
+        except PersistenceError as exc:
+            return Outcome("error", EXIT_USAGE, str(exc))
         if state and state.get("active_run_id"):
             run_id = str(state["active_run_id"])
             try:
@@ -293,7 +296,14 @@ class MetaCodingService:
                 f"last run {latest} finished as {final.outcome}",
                 [f"reason: {final.reason}", f"rounds: {final.rounds_used}"],
             )
-        record = self.store.load_run(latest)
+        try:
+            record = self.store.load_run(latest)
+        except PersistenceError as exc:
+            return Outcome(
+                "error",
+                EXIT_USAGE,
+                f"last run {latest} has unreadable records: {exc}",
+            )
         return Outcome(
             "finished",
             EXIT_OK,
@@ -304,15 +314,18 @@ class MetaCodingService:
         target = run_id or self.store.latest_run_id()
         if target is None:
             return Outcome("error", EXIT_USAGE, "no runs found")
-        final = self.store.load_final(target)
-        if final is None:
-            record = self.store.load_run(target)
-            return Outcome(
-                "unfinished",
-                EXIT_OK,
-                f"run {target} has not finished (status: {record.status.value})",
-                [f"requirement: {record.requirement}"],
-            )
+        try:
+            final = self.store.load_final(target)
+            if final is None:
+                record = self.store.load_run(target)
+                return Outcome(
+                    "unfinished",
+                    EXIT_OK,
+                    f"run {target} has not finished (status: {record.status.value})",
+                    [f"requirement: {record.requirement}"],
+                )
+        except PersistenceError as exc:
+            return Outcome("error", EXIT_USAGE, str(exc))
         lines = [
             f"outcome: {final.outcome}",
             f"reason:  {final.reason}",
@@ -333,7 +346,10 @@ class MetaCodingService:
         target = run_id or self.store.latest_run_id()
         if target is None:
             return Outcome("error", EXIT_USAGE, "no runs found")
-        final = self.store.load_final(target)
+        try:
+            final = self.store.load_final(target)
+        except PersistenceError as exc:
+            return Outcome("error", EXIT_USAGE, str(exc))
         run_dir = self.store.run_dir(target)
         lines = [
             f"run dir: {run_dir}",

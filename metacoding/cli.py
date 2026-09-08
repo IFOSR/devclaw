@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Protocol
 
 from metacoding import __version__
+from metacoding.errors import MetaCodingError
 
 
 def default_emitter():
@@ -209,3 +210,13 @@ def main(argv: list[str] | None = None, app: App | None = None) -> int:
     except KeyboardInterrupt:
         print("\nInterrupted. The run can be resumed with `metacoding resume`.", file=sys.stderr)
         return EXIT_INTERRUPTED
+    except MetaCodingError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_USAGE
+    except Exception as exc:  # noqa: BLE001 - CLI must fail readably
+        print(
+            f"unexpected error: {exc.__class__.__name__}: {exc} "
+            f"(details: .metacoding/runs/*/ and .metacoding/transcripts/)",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
