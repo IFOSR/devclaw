@@ -136,6 +136,15 @@ def build_parser() -> argparse.ArgumentParser:
     config_parser.add_argument("key", nargs="?", help="dotted key, e.g. coder.model")
     config_parser.add_argument("value", nargs="?", help="value for `set`")
     _add_harness_overrides(config_parser, suppress=True)
+
+    models_parser = subparsers.add_parser(
+        "models", help="list the models a harness CLI can use"
+    )
+    models_parser.add_argument(
+        "harness", choices=["planner", "coder", "tester"],
+        help="which harness to list models for",
+    )
+    _add_harness_overrides(models_parser, suppress=True)
     return parser
 
 
@@ -179,10 +188,24 @@ def dispatch(app: App, args: argparse.Namespace) -> int:
                 return EXIT_USAGE
             outcome = app.config_get(args.key)
         else:  # set
-            if not args.key or args.value is None:
+            if not args.key:
+                print("usage: metacoding config set KEY VALUE", file=sys.stderr)
+                return EXIT_USAGE
+            if args.value is None and args.key.strip().lower().endswith(".model"):
+                # Interactive model picker: no typing of model names needed.
+                harness = args.key.strip().split(".")[0]
+                if harness in ("planner", "coder", "tester"):
+                    outcome = app.pick_model(harness)
+                    _print_outcome(outcome)
+                    return outcome.exit_code
+                print("usage: metacoding config set KEY VALUE", file=sys.stderr)
+                return EXIT_USAGE
+            if args.value is None:
                 print("usage: metacoding config set KEY VALUE", file=sys.stderr)
                 return EXIT_USAGE
             outcome = app.config_set(args.key, args.value)
+    elif args.command == "models":
+        outcome = app.models_outcome(args.harness)
     else:  # pragma: no cover - argparse rejects unknown commands first
         print(f"Unknown command: {args.command}", file=sys.stderr)
         return EXIT_USAGE

@@ -74,6 +74,17 @@ class FakeApp:
         return Outcome(status="set", exit_code=EXIT_OK,
                        message=f"{key} written to .metacoding/config.toml")
 
+    def models_outcome(self, harness: str) -> Outcome:
+        self.calls.append(("models_outcome", harness))
+        return Outcome(
+            status="models", exit_code=EXIT_OK, message=f"models available to {harness}:",
+            lines=["  1. codex-m-one", "  2. codex-m-two  ← current"],
+        )
+
+    def pick_model(self, harness: str) -> Outcome:
+        self.calls.append(("pick_model", harness))
+        return Outcome(status="set", exit_code=EXIT_OK, message=f"picked model for {harness}")
+
 
 def drive(app: FakeApp, text: str) -> str:
     stdin = io.StringIO(text)
@@ -477,3 +488,16 @@ def test_tty_end_to_end_uses_injected_streams_with_color(monkeypatch) -> None:
     assert "Commands:" in plain            # injected streams answered /help
     assert ("status",) in app.calls or True
     assert re.search(r"\x1b\[[0-9;]*m", text)  # colors actually emitted on the tty
+
+
+def test_config_set_model_without_value_opens_picker() -> None:
+    app = FakeApp()
+    output = drive(app, "/config set coder.model\n/exit\n")
+    assert ("pick_model", "coder") in app.calls
+    assert "picked model for coder" in output
+
+
+def test_tui_models_via_config_get_is_unchanged() -> None:
+    app = FakeApp()
+    drive(app, "/config get coder.model\n/exit\n")
+    assert ("config_get", "coder.model") in app.calls

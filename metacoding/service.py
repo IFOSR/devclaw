@@ -192,15 +192,164 @@ class MetaCodingService:
     # --- persistent configuration management ----------------------------------
 
     def config_set(self, key: str, value: str) -> Outcome:
-        from metacoding.config import set_config_value
+        from metacoding.config import resolve_config_key, set_config_value
 
         try:
+            section, leaf = resolve_config_key(key)
             set_config_value(self.project_root, key, value)
         except MetaCodingError as exc:
             return Outcome("error", EXIT_USAGE, str(exc))
+        lines: list[str] = []
+        if leaf == "model" and section.startswith("harness."):
+            lines.extend(self._model_catalog_warnings(section, value))
         return Outcome(
-            "set", EXIT_OK, f"{key} written to .metacoding/config.toml"
+            "set", EXIT_OK, f"{key} written to .metacoding/config.toml", lines
         )
+
+    def _model_catalog_warnings(self, harness_section: str, model: str) -> list[str]:
+        """Best-effort hint when a model is not in the CLI's catalog."""
+        if not model:
+            return []
+        from metacoding.catalog import list_models
+
+        name = harness_section.split(".", 1)[1]
+        try:
+            config = self._config()
+            harness_config = config.harness.get(name)
+        except MetaCodingError:
+            return []
+        if harness_config is None:
+            return []
+        entries = list_models(harness_config, current_model=model)
+        if not entries:
+            return []  # catalog unavailable — never block or scare the user
+        if not any(entry.current for entry in entries):
+            return [
+                f"note: '{model}' is not in the {harness_config.command} model "
+                f"list; if the harness fails, run `metacoding models {name}` "
+                f"and pick a listed model"
+            ]
+        return []
+
+    def models_outcome(self, harness: str) -> Outcome:
+        """List the models one harness can use, marking the current one."""
+        from metacoding.catalog import list_models
+
+        harness = harness.strip().lower()
+        try:
+            config = self._config()
+            if harness not in config.harness:
+                raise MetaCodingError(
+                    f"unknown harness {harness!r}; expected planner, coder, or tester"
+                )
+            harness_config = config.harness[harness]
+        except MetaCodingError as exc:
+            return Outcome("error", EXIT_USAGE, str(exc))
+        current = harness_config.model
+        entries = list_models(harness_config, current_model=current)
+        if not entries:
+            return Outcome(
+                "empty",
+                EXIT_OK,
+                f"no model list available for {harness_config.command!r}; "
+                f"current model: {current or '(cli default)'}",
+            )
+        width = max(len(f"{e.provider}/{e.model}" if e.provider != "codex" else e.model) for e in entries)
+        lines = [
+            f"{index:>3}. "
+            + (entry.model if entry.provider == "codex" else entry.model).ljust(width)
+            + (f"  ctx {entry.context}" if entry.context else "")
+            + ("  ← current" if entry.current else "")
+            for index, entry in enumerate(entries, start=1)
+        ]
+        lines.append("")
+        lines.append(
+            f"select with: metacoding config set {harness}.model <name> "
+            f"(or run `metacoding config set {harness}.model` to pick interactively)"
+        )
+        return Outcome(
+            "models", EXIT_OK, f"models available to {harness} ({harness_config.command}):", lines
+        )
+
+    def pick_model(
+        self,
+        harness: str,
+        *,
+        stdin=None,
+        stdout=None,
+    ) -> Outcome:
+        """Interactively choose a model for a harness and persist it.
+
+        Numbered selection; Enter keeps the current model, 0 clears it back
+        to the CLI default. Only usable with an interactive stdin.
+        """
+        import sys
+
+        stdin = stdin if stdin is not None else sys.stdin
+        stdout = stdout if stdout is not None else sys.stdout
+        harness = harness.strip().lower()
+        listing = self.models_outcome(harness)
+        if listing.exit_code != EXIT_OK:
+            return listing
+        try:
+            interactive = stdin.isatty()
+        except Exception:
+            interactive = False
+        if not interactive:
+            stdout.write(listing.message + "\n")
+            for line in listing.lines:
+                stdout.write(line + "\n")
+            stdout.write(
+                "non-interactive input: provide a value, e.g. "
+                f"`metacoding config set {harness}.model <name>`\n"
+            )
+            stdout.flush()
+            return Outcome(
+                "error", EXIT_USAGE, "no value provided and stdin is not interactive"
+            )
+
+        def out(text: str) -> None:
+            stdout.write(text + "\n")
+            stdout.flush()
+
+        out(listing.message)
+        for line in listing.lines:
+            out(line)
+        try:
+            config = self._config()
+            current = config.harness[harness].model or "(cli default)"
+        except MetaCodingError as exc:
+            return Outcome("error", EXIT_USAGE, str(exc))
+        from metacoding.catalog import list_models
+
+        entries = list_models(config.harness[harness], current_model=current)
+        for _ in range(3):
+            out("")
+            stdout.write(
+                f"select model for {harness} "
+                f"[number | Enter=keep ({current}) | 0=cli default]: "
+            )
+            stdout.flush()
+            line = stdin.readline()
+            if line == "":
+                return Outcome("cancelled", EXIT_USAGE, "selection cancelled")
+            answer = line.strip()
+            if not answer:
+                return Outcome("kept", EXIT_OK, f"kept current model for {harness}")
+            if answer == "0":
+                from metacoding.config import set_config_value
+
+                set_config_value(self.project_root, f"{harness}.model", '""')
+                return Outcome(
+                    "cleared", EXIT_OK, f"{harness}.model cleared; the CLI default is used"
+                )
+            if answer.isdigit() and 1 <= int(answer) <= len(entries):
+                chosen = entries[int(answer) - 1].model
+                return self.config_set(f"{harness}.model", chosen)
+            out(
+                f"invalid choice {answer!r}; enter a number between 1 and {len(entries)}"
+            )
+        return Outcome("error", EXIT_USAGE, "too many invalid selections; cancelled")
 
     def _settings(self) -> dict:
         from metacoding.config import effective_config_settings, read_raw_config

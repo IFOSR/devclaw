@@ -289,6 +289,12 @@ def _handle_config(renderer: _Renderer, app: App, command: str) -> Outcome | Non
         return _safe_call(
             renderer, "/config set", lambda: app.config_set(rest[1], " ".join(rest[2:]))
         )
+    if action == "set" and len(rest) == 2 and rest[1].strip().lower().endswith(".model"):
+        harness = rest[1].strip().split(".")[0]
+        if harness in ("planner", "coder", "tester"):
+            return _safe_call(
+                renderer, f"/config set {harness}.model", lambda: app.pick_model(harness)
+            )
     renderer.error("usage: /config [get KEY | set KEY VALUE]")
     return None
 
