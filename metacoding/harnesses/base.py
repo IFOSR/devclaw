@@ -88,6 +88,9 @@ class HarnessContext:
     policy: Any = None
     max_execution_seconds: float | None = None
     transcript_sink: Callable[[str, CommandResult], None] | None = None
+    #: Live output forwarding: ``(stage, stream_name, text_chunk)`` while the
+    #: harness is still running.
+    stream_sink: Callable[[str, str, str], None] | None = None
 
     @property
     def round_dir(self) -> Path:
@@ -116,6 +119,21 @@ def _output_tail(*streams: str, max_lines: int = 6, max_chars: int = 600) -> str
     if len(tail) > max_chars:
         tail = "..." + tail[-max_chars:]
     return tail
+
+
+def _live_output_forwarder(ctx: "HarnessContext", stage: str):
+    """Bridge the process runner's live chunks to the context stream sink."""
+    sink = getattr(ctx, "stream_sink", None)
+    if sink is None:
+        return None
+
+    def on_output(chunk: str, stream: str) -> None:
+        try:
+            sink(stage, stream, chunk)
+        except Exception:  # observer errors must never kill the harness
+            pass
+
+    return on_output
 
 
 def strip_code_fences(text: str) -> str:
@@ -210,6 +228,7 @@ class Harness(ABC):
             idle_timeout_seconds=ctx.idle_timeout_seconds,
             max_execution_seconds=ctx.max_execution_seconds,
             env=self.invocation_env(),
+            on_output=_live_output_forwarder(ctx, stage),
         )
         if ctx.transcript_sink is not None:
             ctx.transcript_sink(stage, result)

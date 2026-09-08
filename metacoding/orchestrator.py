@@ -126,6 +126,10 @@ class Orchestrator:
     def _info(self, message: str) -> None:
         self.emit({"kind": "info", "message": message})
 
+    def _emit_stage_result(self, stage: str, title: str, lines: list[str]) -> None:
+        """Report a finished stage's outcome and artifact paths to the UI."""
+        self.emit({"kind": "stage_result", "stage": stage, "title": title, "lines": lines})
+
     # --- public entry points ---------------------------------------------------
 
     def start(self, requirement: str) -> OrchestratorResult:
@@ -393,6 +397,23 @@ class Orchestrator:
             allowed_patterns=(),
         )
         self.store.save_plan(record.run_id, plan)
+        self._emit_stage_result(
+            "planner",
+            f"Planner finished (round plan)",
+            [
+                f"goal: {plan.goal}",
+                f"tasks: {len(plan.coding_tasks)}  "
+                f"acceptance criteria: {len(plan.acceptance_criteria)} "
+                f"({sum(1 for c in plan.acceptance_criteria if c.priority == 'blocking')} blocking)",
+                f"allowed paths: {', '.join(plan.change_policy.allowed_paths)}",
+                "contract documents:",
+                "  - docs/metacoding/PRD.md",
+                "  - docs/metacoding/ARCHITECTURE.md",
+                "  - docs/metacoding/IMPLEMENTATION_PLAN.md",
+                "  - docs/metacoding/ACCEPTANCE.md",
+                f"plan artifact: .metacoding/runs/{record.run_id}/initial-plan.json",
+            ],
+        )
         self._render_contract_docs(record.run_id, record.requirement, plan)
         record.status = RunStatus.CODING
         record.current_round = 0
@@ -477,6 +498,22 @@ class Orchestrator:
                 "detected": changed,
                 "reported_by_coder": list(coding.changed_files),
             },
+        )
+        self._emit_stage_result(
+            "coder",
+            f"Coder finished round {round_number}",
+            [
+                f"status: {coding.status} — {coding.summary}"
+                + (f" (blocked: {coding.blocked_reason})" if coding.blocked_reason else ""),
+                f"changed files ({len(policy_files)}):",
+                *[f"  - {path}" for path in policy_files],
+                *(
+                    [f"tests added/changed: {', '.join(coding.tests_added_or_changed)}"]
+                    if coding.tests_added_or_changed
+                    else []
+                ),
+                f"report: .metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/coding-report.json",
+            ],
         )
 
         protected = protected_path_gate(policy_files, plan.change_policy)
@@ -595,12 +632,56 @@ class Orchestrator:
             self.store.round_dir(record.run_id, round_number) / "host-checks.json",
             {"round": round_number, "checks": round_record.host_checks},
         )
+        passed = sum(1 for item in round_record.host_checks if item["exit_code"] == 0)
+        acceptance_pass = sum(
+            1 for item in report.acceptance_results if item.status == "pass"
+        )
+        severity_counts: dict[str, int] = {}
+        for finding in report.findings:
+            severity_counts[finding.severity] = severity_counts.get(finding.severity, 0) + 1
+        self._emit_stage_result(
+            "tester",
+            f"Tester finished round {round_number}",
+            [
+                f"verdict: {report.status}  "
+                f"acceptance: {acceptance_pass}/{len(report.acceptance_results)} passed",
+                f"host checks: {passed}/{len(round_record.host_checks)} passed",
+                *(
+                    ["findings: " + ", ".join(f"{count}x {sev}" for sev, count in sorted(severity_counts.items()))]
+                    if severity_counts
+                    else ["findings: none"]
+                ),
+                *(
+                    [f"PRD drift: {len(report.prd_drift)} item(s)"]
+                    if report.prd_drift
+                    else []
+                ),
+                "artifacts:",
+                "  - docs/metacoding/TEST_REPORT.md",
+                f"  - .metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/tester-report.json",
+                f"  - .metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/host-checks.json",
+            ],
+        )
 
         fingerprint = failure_fingerprint(report)
         if fingerprint:
             record.failure_history.append(fingerprint)
             self.store.save_run(record, active_status=RunStatus.PLANNER_REVIEW)
         return _RoundOutcome(round_record)
+
+    def _host_check_streamer(self, run_id: str, round_number: int):
+        def on_output(chunk: str, stream: str) -> None:
+            self.emit(
+                {
+                    "kind": "stream",
+                    "harness": f"host-checks (round {round_number})",
+                    "stage": "host_checks",
+                    "stream": stream,
+                    "text": chunk,
+                }
+            )
+
+        return on_output
 
     def _run_host_checks(self, record: RunRecord, round_number: int) -> list[dict]:
         """Execute the project's test commands host-side.
@@ -620,6 +701,7 @@ class Orchestrator:
                     cwd=self.project_root,
                     idle_timeout_seconds=self.config.limits.idle_timeout_seconds,
                     max_execution_seconds=self.config.limits.max_execution_seconds,
+                    on_output=self._host_check_streamer(record.run_id, round_number),
                 )
             except HarnessCommandMissing as exc:
                 results.append(
@@ -687,6 +769,20 @@ class Orchestrator:
         )
         round_record.planner_decision = decision
         self.store.save_round(record.run_id, round_record)
+        decision_lines = [
+            f"decision: {decision.decision} — {decision.reason[:300]}",
+        ]
+        if decision.rework_tasks:
+            decision_lines.append(
+                "rework tasks: "
+                + ", ".join(task.id for task in decision.rework_tasks)
+            )
+        decision_lines.append(
+            f"report: .metacoding/runs/{record.run_id}/rounds/round-{round_number:03d}/planner-decision.json"
+        )
+        self._emit_stage_result(
+            "planner_review", f"Planner review finished round {round_number}", decision_lines
+        )
 
         if decision.decision == "blocked":
             stop = self._finalize(
@@ -981,6 +1077,9 @@ class Orchestrator:
             context_fields.setdefault(
                 "max_execution_seconds", self.config.limits.max_execution_seconds
             )
+            context_fields.setdefault(
+                "stream_sink", self._make_stream_sink(harness, stage, record.run_id)
+            )
             context = HarnessContext(
                 requirement=record.requirement,
                 run_id=record.run_id,
@@ -1006,6 +1105,34 @@ class Orchestrator:
             f"{stage} failed after retry: {last_error}\n"
             f"transcripts: {self.store.run_dir(record.run_id) / 'transcripts'}"
         )
+
+    def _make_stream_sink(self, harness: Harness, stage: str, run_id: str):
+        from metacoding.stream_format import CodexJsonlFormatter
+
+        # codex stdout is JSONL (--json); render it human-friendly. pi already
+        # streams plain text; stderr stays verbatim for both.
+        formatter = (
+            CodexJsonlFormatter()
+            if harness.provider == "codex"
+            else None
+        )
+
+        def sink(stage_name: str, stream: str, text: str) -> None:
+            rendered = text
+            if formatter is not None and stream == "stdout":
+                rendered = formatter.feed(text)
+            if rendered:
+                self.emit(
+                    {
+                        "kind": "stream",
+                        "harness": f"{harness.provider}-{harness.name}",
+                        "stage": stage_name,
+                        "stream": stream,
+                        "text": rendered,
+                    }
+                )
+
+        return sink
 
     def _make_transcript_sink(self, harness: Harness, stage: str, run_id: str, attempt: int):
         def sink(stage_name: str, result) -> None:

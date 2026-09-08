@@ -107,6 +107,26 @@ class _Renderer:
             )
         self.stdout.flush()
 
+    def stream(self, text: str) -> None:
+        """Live harness output, verbatim, without added newlines."""
+        if self.console is not None:
+            self.console.print(text, end="", style="dim")
+        else:
+            self.stdout.write(text)
+        self.stdout.flush()
+
+    def stage_result(self, title: str, lines: list[str]) -> None:
+        if self.console is not None:
+            self.console.rule(title, style="bold green")
+            for line in lines:
+                self.console.print(line, style="green")
+        else:
+            self.stdout.write("── " + title + " ──\n")
+            for line in lines:
+                self.stdout.write(line + "\n")
+            self.stdout.write("\n")
+        self.stdout.flush()
+
     def phase(self, phase_name: str, message: str) -> None:
         self.text(f"[{phase_name}] {message}", style="bold cyan")
 
@@ -225,6 +245,12 @@ def run_tui(app: App, *, stdin: IO[str] | None = None, stdout: IO[str] | None = 
             renderer.phase(str(event.get("phase", "")), str(event.get("message", "")))
         elif kind == "info":
             renderer.text(str(event.get("message", "")))
+        elif kind == "stream":
+            renderer.stream(str(event.get("text", "")))
+        elif kind == "stage_result":
+            renderer.stage_result(
+                str(event.get("title", "")), list(event.get("lines", []))
+            )
 
     while True:
         line = input_loop.read()

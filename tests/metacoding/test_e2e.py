@@ -202,11 +202,24 @@ def default_attempts(**overrides) -> dict[str, list]:
 
 
 def test_cli_run_accepted_full_stack(tmp_path: Path, capsys) -> None:
-    root = make_project(tmp_path, default_attempts())
+    verbose = {
+        "plan": [{"stdout_lines": ["[fake] scanning project"], "payload": PLAN_STEP}],
+        "code": [code_step(files={"src/audit.py": "def log(): pass\n"})],
+        "test": [make_test_step()],
+        "review": [review_step()],
+    }
+    root = make_project(tmp_path, verbose)
     code = cli_main(["--project-root", str(root), "run", "add audit logging"])
     out = capsys.readouterr().out
     assert code == EXIT_OK
     assert "[planning]" in out and "[coding]" in out and "[done]" in out
+    # live harness output is streamed, not swallowed
+    assert "[fake] scanning project" in out
+    # each stage reports its outcome and artifact paths
+    assert "── Planner finished" in out and "docs/metacoding/PRD.md" in out
+    assert "── Coder finished round 1" in out and "  - src/audit.py" in out
+    assert "── Tester finished round 1" in out and "TEST_REPORT.md" in out
+    assert "decision: accept" in out
 
     runs_dir = root / ".metacoding" / "runs"
     run_id = next(path.name for path in runs_dir.iterdir())

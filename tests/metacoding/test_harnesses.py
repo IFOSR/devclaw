@@ -337,3 +337,26 @@ def test_nonzero_exit_surfaces_output_tail(tmp_path: Path) -> None:
     message = str(excinfo.value)
     assert "fake harness failure" in message  # stderr tail inlined
     assert "exit" in message
+
+
+def test_stream_sink_receives_live_output(tmp_path: Path) -> None:
+    scenario = {
+        "attempts": {
+            "plan": [
+                {
+                    "stdout_lines": ["analyzing repo...", "reading README.md"],
+                    "payload": VALID_PLAN,
+                }
+            ]
+        }
+    }
+    planner = FakePlanner(fake_harness_config(tmp_path, scenario, "planner"), tmp_path)
+    ctx = make_context(tmp_path)
+    ctx.report_dir.mkdir(parents=True, exist_ok=True)
+    chunks: list[tuple] = []
+    ctx.stream_sink = lambda stage, stream, text: chunks.append((stage, stream, text))
+    plan = planner.plan(ctx)
+    assert plan.goal == "Add audit logging"
+    assert chunks and all(stage == "plan" and stream == "stdout" for stage, stream, _ in chunks)
+    joined = "".join(text for _, _, text in chunks)
+    assert "analyzing repo..." in joined and "reading README.md" in joined

@@ -501,3 +501,23 @@ def test_tui_models_via_config_get_is_unchanged() -> None:
     app = FakeApp()
     drive(app, "/config get coder.model\n/exit\n")
     assert ("config_get", "coder.model") in app.calls
+
+
+def test_tui_renders_stream_and_stage_result_events() -> None:
+    class StreamingApp(FakeApp):
+        def run(self, requirement: str, emit=None) -> Outcome:
+            emit({"kind": "phase", "phase": "coding", "message": "Pi is implementing round 1."})
+            emit({"kind": "stream", "harness": "pi-coder", "stage": "code",
+                  "stream": "stdout", "text": "editing src/app.py\n"})
+            emit({"kind": "stream", "harness": "pi-coder", "stage": "code",
+                  "stream": "stdout", "text": "running tests...\n"})
+            emit({"kind": "stage_result", "stage": "coder", "title": "Coder finished round 1",
+                  "lines": ["status: completed — implemented", "changed files (1):",
+                            "  - src/app.py"]})
+            return Outcome(status="delivered", exit_code=EXIT_OK, message="done")
+
+    output = drive(StreamingApp(), "do work\n/exit\n")
+    assert "editing src/app.py" in output
+    assert "running tests..." in output
+    assert "Coder finished round 1" in output
+    assert "  - src/app.py" in output

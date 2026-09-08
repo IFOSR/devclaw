@@ -111,6 +111,9 @@ def run_subprocess_main(argv: list[str] | None = None) -> int:
         print("fake harness failure", file=sys.stderr)
         return 7
 
+    for line in step.get("stdout_lines") or []:
+        print(str(line), flush=True)
+
     payload = step.get("payload", {k: v for k, v in step.items() if k != "files"})
     report_path = Path(args.report)
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -159,6 +162,13 @@ class _FakeHarnessMixin(Harness):
                 f"fake harness wrote no structured report for stage {stage!r}"
             )
         apply_step_to_project(self.project_root, step)
+        stream_sink = getattr(ctx, "stream_sink", None)
+        if stream_sink is not None:
+            for line in step.get("stdout_lines") or []:
+                try:
+                    stream_sink(stage, "stdout", str(line) + "\n")
+                except Exception:  # pragma: no cover - observer errors ignored
+                    pass
         tamper = step.get("tamper_evidence")
         if tamper:
             # Simulate a harness rewriting host-owned runtime evidence.

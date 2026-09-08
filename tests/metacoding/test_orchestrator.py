@@ -936,3 +936,48 @@ def test_final_report_is_deliverable_under_enumerated_allowed_paths(tmp_path: Pa
     first_delivery = deliverer.calls[0][1]
     assert "docs/metacoding/FINAL_REPORT.md" in first_delivery
     assert not any("FINAL_REPORT" in w for w in result.final.warnings if "not staged" in w)
+
+
+# --- live streaming and stage-result summaries ---------------------------------------
+
+
+def test_run_emits_stream_and_stage_result_events(tmp_path: Path) -> None:
+    verbose_plan = dict(plan_payload())
+    verbose_plan = {"stdout_lines": ["scanning files", "reading config"], "payload": verbose_plan}
+    script = {
+        "attempts": {
+            "plan": [verbose_plan],
+            "code": [code_payload(files={"src/audit.py": "log()\n"})],
+            "test": [make_test_step()],
+            "review": [review_payload()],
+        }
+    }
+    orchestrator, events = make_orchestrator(tmp_path, script)
+    result = orchestrator.start("add audit logging")
+    assert result.status is RunStatus.DELIVERED
+
+    streams = [e for e in events if e.get("kind") == "stream"]
+    assert streams and any("scanning files" in e["text"] for e in streams)
+    assert all(set(("harness", "stage", "stream", "text")) <= set(e) for e in streams)
+
+    summaries = {e["stage"]: e for e in events if e.get("kind") == "stage_result"}
+    assert set(summaries) >= {"planner", "coder", "tester", "planner_review"}
+    planner_lines = "\n".join(summaries["planner"]["lines"])
+    assert "docs/metacoding/PRD.md" in planner_lines
+    assert "initial-plan.json" in planner_lines
+    coder_lines = "\n".join(summaries["coder"]["lines"])
+    assert "src/audit.py" in coder_lines and "coding-report.json" in coder_lines
+    tester_lines = "\n".join(summaries["tester"]["lines"])
+    assert "TEST_REPORT.md" in tester_lines and "host-checks.json" in tester_lines
+    review_lines = "\n".join(summaries["planner_review"]["lines"])
+    assert "decision: accept" in review_lines
+
+
+def test_stage_result_summaries_reflect_rework(tmp_path: Path) -> None:
+    script = scenario(review=[review_payload("rework"), review_payload()])
+    orchestrator, events = make_orchestrator(tmp_path, script)
+    orchestrator.start("add audit logging")
+    review_summaries = [
+        e for e in events if e.get("kind") == "stage_result" and e["stage"] == "planner_review"
+    ]
+    assert "rework tasks: REWORK-001" in "\n".join(review_summaries[0]["lines"])

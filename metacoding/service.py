@@ -37,6 +37,12 @@ def default_emitter() -> EVENT:
             print(f"[{event.get('phase')}] {event.get('message', '')}")
         elif event.get("kind") == "info":
             print(event.get("message", ""))
+        elif event.get("kind") == "stream":
+            print(event.get("text", ""), end="", flush=True)
+        elif event.get("kind") == "stage_result":
+            print("── " + str(event.get("title", "")) + " ──")
+            for line in event.get("lines", []):
+                print(line)
 
     return emit
 
