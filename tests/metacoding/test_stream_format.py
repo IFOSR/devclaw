@@ -203,3 +203,34 @@ def test_pi_jsonl_drops_noise_and_errors():
     assert "│ write: error" in out
     assert "agent_start" not in out
     assert "session" not in out
+
+
+def test_codex_benign_notice_is_labeled_note_not_error():
+    from metacoding.stream_format import CodexJsonlFormatter
+
+    f = CodexJsonlFormatter()
+    out = feed_all(
+        f,
+        [
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "item_0",
+                        "type": "error",
+                        "message": "Skill descriptions were shortened to fit the skills context budget. Codex can still see every skill, but some descriptions are shorter.",
+                    },
+                }
+            )
+            + "\n",
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"id": "item_1", "type": "error", "message": "cannot write file"},
+                }
+            )
+            + "\n",
+        ],
+    )
+    assert "│ note: Skill descriptions were shortened" in out
+    assert "│ error: cannot write file" in out

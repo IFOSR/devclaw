@@ -192,9 +192,23 @@ class CodexJsonlFormatter:
                 return f"cmd: {_preview(str(command or ''))}"
             return f"cmd (exit {item.get('exit_code', '?')}): {_preview(str(command or ''))}"
         if item_type == "error":
-            return "error: " + _preview(str(item.get("message", "")))
+            return self._error_label(item.get("message", ""))
         if item_type in ("reasoning", "reasoning_text"):
             return ""
         if item_type == "web_search":
             return f"web search: {_preview(str(item.get('query', '')))}"
         return _preview(f"{item_type}{state}") if item_type else ""
+
+    @staticmethod
+    def _error_label(message: str) -> str:
+        """codex reuses the 'error' item type for non-fatal notices; label
+        the known informational ones 'note' instead of alarming users."""
+        lowered = str(message).lower()
+        benign_markers = (
+            "skill descriptions were shortened",
+            "context budget",
+            "descriptions are shorter",
+        )
+        if any(marker in lowered for marker in benign_markers):
+            return "note: " + _preview(str(message))
+        return "error: " + _preview(str(message))
