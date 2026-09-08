@@ -913,3 +913,26 @@ def test_tester_writing_its_own_test_report_is_allowed(tmp_path: Path) -> None:
     orchestrator, _ = make_orchestrator(tmp_path, script)
     result = orchestrator.start("add audit logging")
     assert result.status is RunStatus.DELIVERED
+
+
+def test_final_report_is_deliverable_under_enumerated_allowed_paths(tmp_path: Path) -> None:
+    """A planner that enumerates specific files instead of docs/metacoding
+    broadly must not exclude the host-rendered FINAL_REPORT.md."""
+    deliverer = RecordingDeliverer()
+    github = replace(default_config().github, enabled=True)
+    config = replace(make_config(), github=github)
+    narrow = dict(plan_payload(allowed=["src/**", "tests/**"]))  # no docs at all
+    script = {
+        "attempts": {
+            "plan": [narrow],
+            "code": [code_payload(files={"src/audit.py": "log()\n"})],
+            "test": [make_test_step()],
+            "review": [review_payload()],
+        }
+    }
+    orchestrator, _ = make_orchestrator(tmp_path, script, config, deliverer=deliverer)
+    result = orchestrator.start("add audit logging")
+    assert result.status is RunStatus.DELIVERED
+    first_delivery = deliverer.calls[0][1]
+    assert "docs/metacoding/FINAL_REPORT.md" in first_delivery
+    assert not any("FINAL_REPORT" in w for w in result.final.warnings if "not staged" in w)

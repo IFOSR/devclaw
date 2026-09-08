@@ -833,6 +833,17 @@ class Orchestrator:
             github=None,
         )
         self._render_final_report(preliminary)
+        # Register the rendered report like the other host-rendered contract
+        # documents so it is deliverable even when the planner's allowed_paths
+        # enumerate specific files instead of docs/metacoding broadly.
+        self._record_contract_hashes(
+            record.run_id,
+            {
+                "docs/metacoding/FINAL_REPORT.md": _file_digest(
+                    self.project_root / "docs" / "metacoding" / "FINAL_REPORT.md"
+                )
+            },
+        )
         owned, ownership_warnings = compute_owned_delivery_files(
             self.project_root, self.store, record, plan
         )
