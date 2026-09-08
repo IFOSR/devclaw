@@ -263,9 +263,9 @@ class MetaCodingService:
             run_id = str(state["active_run_id"])
             try:
                 record = self.store.load_run(run_id)
+                lock = read_lock(self.project_root)
             except PersistenceError as exc:
                 return Outcome("error", EXIT_USAGE, str(exc))
-            lock = read_lock(self.project_root)
             lines = [
                 f"run id:    {run_id}",
                 f"status:    {record.status.value}",
@@ -288,15 +288,15 @@ class MetaCodingService:
                     "(see docs/metacoding/config.example.toml)",
                 ],
             )
-        final = self.store.load_final(latest)
-        if final is not None:
-            return Outcome(
-                "finished",
-                EXIT_OK,
-                f"last run {latest} finished as {final.outcome}",
-                [f"reason: {final.reason}", f"rounds: {final.rounds_used}"],
-            )
         try:
+            final = self.store.load_final(latest)
+            if final is not None:
+                return Outcome(
+                    "finished",
+                    EXIT_OK,
+                    f"last run {latest} finished as {final.outcome}",
+                    [f"reason: {final.reason}", f"rounds: {final.rounds_used}"],
+                )
             record = self.store.load_run(latest)
         except PersistenceError as exc:
             return Outcome(

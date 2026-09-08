@@ -55,6 +55,8 @@ except ImportError:  # pragma: no cover - depends on environment
 
 try:  # pragma: no cover - exercised implicitly via the input loop
     from prompt_toolkit.completion import WordCompleter as _WordCompleter
+    from prompt_toolkit.input import create_input as _create_input
+    from prompt_toolkit.output import create_output as _create_output
     from prompt_toolkit.shortcuts import PromptSession as _PromptSession
 
     _HAVE_PROMPT_TOOLKIT = True
@@ -74,10 +76,10 @@ class _Renderer:
         self.console = None
         if _HAVE_RICH:
             try:
-                # markup/highlight off: lifecycle text must stay literal.
-                self.console = _RichConsole(
-                    file=stdout, markup=False, highlight=False, no_color=True
-                )
+                # markup/highlight off: lifecycle text must stay literal;
+                # colors follow rich's own tty/TERM/NO_COLOR detection so
+                # piped output stays plain while terminals get styled text.
+                self.console = _RichConsole(file=stdout, markup=False, highlight=False)
             except Exception:  # pragma: no cover - defensive
                 self.console = None
 
@@ -146,16 +148,26 @@ class _InputLoop:
         self.stdin = stdin
         self.session = None
         if _HAVE_PROMPT_TOOLKIT and os.environ.get("METACODING_TUI_PLAIN") != "1":
-            try:
-                interactive = hasattr(stdin, "isatty") and stdin.isatty()
-            except Exception:  # pragma: no cover - exotic streams
-                interactive = False
-            if interactive:
-                completer = _WordCompleter(list(COMMANDS), sentence=True)
+            if _is_tty(stdin) and _is_tty(stdout):
                 try:
-                    self.session = _PromptSession("metacoding > ", completer=completer)
+                    self.session = self._build_session(stdin, stdout)
                 except Exception:  # pragma: no cover - terminal lacks support
                     self.session = None
+
+    @staticmethod
+    def _build_session(stdin: IO[str], stdout: IO[str]):
+        """Create a PromptSession bound to the injected streams.
+
+        prompt_toolkit defaults to the process-level sys.stdin/sys.stdout;
+        passing explicit input/output keeps run_tui(stdin=..., stdout=...)
+        authoritative for tests, embedding, and redirection.
+        """
+        input_impl = _create_input(stdin=stdin)
+        output_impl = _create_output(stdout=stdout)
+        completer = _WordCompleter(list(COMMANDS), sentence=True)
+        return _PromptSession(
+            "metacoding > ", completer=completer, input=input_impl, output=output_impl
+        )
 
     def read(self) -> str | None:
         """Return the next input line, or None on EOF."""
@@ -279,6 +291,13 @@ def _handle_config(renderer: _Renderer, app: App, command: str) -> Outcome | Non
         )
     renderer.error("usage: /config [get KEY | set KEY VALUE]")
     return None
+
+
+def _is_tty(stream) -> bool:
+    try:
+        return bool(stream.isatty())
+    except Exception:
+        return False
 
 
 def _cwd_label() -> str:

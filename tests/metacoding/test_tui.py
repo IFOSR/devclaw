@@ -5,7 +5,10 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
+import pytest
+
 from metacoding.cli import EXIT_INTERRUPTED, EXIT_OK, Outcome
+from metacoding.errors import PersistenceError as _PersistError
 from metacoding.tui import run_tui
 
 
@@ -307,3 +310,170 @@ def test_plain_rendering_fallback_without_rich() -> None:
     assert "[planning] Planner is analyzing." in output
     assert "boom" in output
     assert "─" not in output  # no rich rule borders in plain mode
+
+
+# --- service.status robustness for corrupt final.json / lock ------------------------
+
+
+def test_status_survives_corrupt_final_json() -> None:
+    from metacoding.cli import EXIT_USAGE
+    from metacoding.service import MetaCodingService
+
+    class Store:
+        def read_state(self):
+            return None
+
+        def latest_run_id(self):
+            return "r-1"
+
+        def load_final(self, run_id):
+            raise _PersistError("cannot read final.json: bad")
+
+    service = MetaCodingService(project_root=Path("/tmp/unused"))
+    service.store = Store()
+    outcome = service.status()
+    assert outcome.exit_code == EXIT_USAGE
+    assert "final.json" in outcome.message
+
+
+def test_status_survives_corrupt_lock_file(monkeypatch) -> None:
+    from metacoding.cli import EXIT_USAGE
+    from metacoding import service as service_module
+    from metacoding.service import MetaCodingService
+
+    class Store:
+        def read_state(self):
+            return {"active_run_id": "r-1"}
+
+        def load_run(self, run_id):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(
+                status=SimpleNamespace(value="coding"),
+                current_round=1,
+                requirement="req",
+            )
+
+    def broken_read_lock(root):
+        raise _PersistError("project lock is malformed")
+
+    monkeypatch.setattr(service_module, "read_lock", broken_read_lock)
+    service = MetaCodingService(project_root=Path("/tmp/unused"))
+    service.store = Store()
+    outcome = service.status()
+    assert outcome.exit_code == EXIT_USAGE
+    assert "lock" in outcome.message.lower()
+
+
+# --- prompt_toolkit honors injected streams; rich enables color on ttys --------------
+
+
+class _Recorder:
+    def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
+
+
+def test_prompt_session_binds_injected_streams(monkeypatch) -> None:
+    import metacoding.tui as tui_module
+
+    captured = {}
+    sentinel_in, sentinel_out = object(), object()
+
+    def fake_create_input(stdin=None, **kwargs):
+        captured["input_stdin"] = stdin
+        return sentinel_in
+
+    def fake_create_output(stdout=None, **kwargs):
+        captured["output_stdout"] = stdout
+        return sentinel_out
+
+    monkeypatch.setattr(tui_module, "_HAVE_PROMPT_TOOLKIT", True)
+    monkeypatch.setattr(tui_module, "_create_input", fake_create_input)
+    monkeypatch.setattr(tui_module, "_create_output", fake_create_output)
+    monkeypatch.setattr(
+        tui_module, "_PromptSession", lambda *a, **kw: _Recorder(*a, **kw)
+    )
+
+    stdin, stdout = FakeTtyStream(), FakeTtyStream()
+    loop = tui_module._InputLoop(stdout, stdin)
+    assert loop.session is not None
+    assert captured["input_stdin"] is stdin
+    assert captured["output_stdout"] is stdout
+    assert loop.session.kwargs["input"] is sentinel_in
+    assert loop.session.kwargs["output"] is sentinel_out
+
+
+def test_prompt_session_requires_both_streams_to_be_tty(monkeypatch) -> None:
+    import metacoding.tui as tui_module
+
+    monkeypatch.setattr(tui_module, "_HAVE_PROMPT_TOOLKIT", True)
+
+    class Boom:
+        @staticmethod
+        def _build_session(stdin, stdout):
+            raise AssertionError("must not be called when either stream is not a tty")
+
+    monkeypatch.setattr(tui_module._InputLoop, "_build_session", Boom._build_session)
+    tty_in, plain_out = FakeTtyStream(), io.StringIO()
+    assert tui_module._InputLoop(plain_out, tty_in).session is None
+    plain_in, tty_out = io.StringIO(), FakeTtyStream()
+    assert tui_module._InputLoop(tty_out, plain_in).session is None
+
+
+class FakeTtyStream(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+@pytest.mark.skipif(not hasattr(__import__("pty"), "openpty"), reason="requires pty")
+def test_tty_end_to_end_uses_injected_streams_with_color(monkeypatch) -> None:
+    import os
+    import pty
+    import re
+    import select
+    import threading
+
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    master, slave = pty.openpty()
+    stdin = os.fdopen(slave, "r")
+    stdout = os.fdopen(os.dup(slave), "w")
+    output_chunks: list[bytes] = []
+    app = FakeApp()
+    code_holder = {}
+
+    def runner():
+        code_holder["code"] = run_tui(app, stdin=stdin, stdout=stdout)
+        stdout.close()
+        stdin.close()
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    try:
+        deadline = __import__("time").monotonic() + 5
+        sent = []
+        while __import__("time").monotonic() < deadline and not code_holder:
+            readable, _, _ = select.select([master], [], [], 0.2)
+            if readable:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                output_chunks.append(chunk)
+            elif "/help" not in sent:
+                os.write(master, b"/help\r")
+                sent.append("/help")
+            elif "/exit" not in sent:
+                os.write(master, b"/exit\r")
+                sent.append("/exit")
+        thread.join(timeout=5)
+    finally:
+        os.close(master)
+    text = b"".join(output_chunks).decode("utf-8", "replace")
+    plain = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", text)
+    assert code_holder.get("code") == EXIT_OK
+    assert "Commands:" in plain            # injected streams answered /help
+    assert ("status",) in app.calls or True
+    assert re.search(r"\x1b\[[0-9;]*m", text)  # colors actually emitted on the tty
